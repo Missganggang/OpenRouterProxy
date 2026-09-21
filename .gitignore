@@ -36,3 +36,8 @@ startup.err
 .vscode/
 .DS_Store
 Thumbs.db
+# 运行时日志（本地调试残留，任何层级都不入库）
+**/st.log
+**/st.err
+**/*.log
+**/*.err
