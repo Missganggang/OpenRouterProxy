@@ -14,16 +14,23 @@ import (
 
 func echoTarget(t *testing.T) nodeproto.ConfigTarget {
 	t.Helper()
-	tcp, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var tcp net.Listener
+	var udp *net.UDPConn
+	var err error
+	port := 0
+	for {
+		tcp, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port = tcp.Addr().(*net.TCPAddr).Port
+		udp, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+		if err == nil {
+			break
+		}
+		tcp.Close()
 	}
 	t.Cleanup(func() { _ = tcp.Close() })
-	port := tcp.Addr().(*net.TCPAddr).Port
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { _ = udp.Close() })
 	go func() {
 		for {
@@ -182,20 +189,19 @@ func TestEngineRemovalDisableAndIncremental(t *testing.T) {
 	}
 }
 
-func TestEngineRejectsUnsupportedWithoutBypassing(t *testing.T) {
+func TestEngineRejectsInvalidAndKeepsWorkingSnapshot(t *testing.T) {
 	target := echoTarget(t)
 	tests := []struct {
 		name string
 		edit func(*nodeproto.ConfigResponse)
 	}{
-		{"tunnel", func(c *nodeproto.ConfigResponse) { c.Rules[0].Protocol = "tls" }},
+		{"tunnel", func(c *nodeproto.ConfigResponse) { c.Rules[0].Protocol = "unknown" }},
 		{"outbound", func(c *nodeproto.ConfigResponse) { c.Rules[0].OutboundGroupID = 2 }},
-		{"speed", func(c *nodeproto.ConfigResponse) { c.Rules[0].SpeedLimit = 1024 }},
-		{"ip", func(c *nodeproto.ConfigResponse) { c.Rules[0].IPLimit = 1 }},
+		{"speed", func(c *nodeproto.ConfigResponse) { c.Rules[0].SpeedLimit = -1 }},
+		{"ip", func(c *nodeproto.ConfigResponse) { c.Rules[0].IPLimit = -1 }},
 		{"chain", func(c *nodeproto.ConfigResponse) { c.Rules[0].ChainGroups = []uint64{2} }},
 		{"reverse", func(c *nodeproto.ConfigResponse) { c.Rules[0].ReverseEnable = true }},
-		{"sni", func(c *nodeproto.ConfigResponse) { c.Rules[0].SNI = "example.com" }},
-		{"option", func(c *nodeproto.ConfigResponse) { c.Rules[0].Options = map[string]interface{}{"udp_over_tcp": true} }},
+		{"sni", func(c *nodeproto.ConfigResponse) { c.Rules[0].IsSubRule = true }},
 		{"group_acl", func(c *nodeproto.ConfigResponse) {
 			c.DeviceGroupConfig = map[string]nodeproto.DeviceGroupConfig{"0": {Config: map[string]interface{}{"allowed_host": []string{".example.com"}}}}
 		}},
@@ -207,18 +213,20 @@ func TestEngineRejectsUnsupportedWithoutBypassing(t *testing.T) {
 			cfg := directConfig(target)
 			address := applyOK(t, e, cfg)
 			tc.edit(&cfg)
+			cfg.ConfigVersion = 2
 			results := e.Apply(cfg)
 			if results[0].Status != "failed" || results[0].Error == "" {
 				t.Fatalf("unsupported rule reported success: %+v", results)
 			}
-			if len(e.RunningRules()) != 0 {
-				t.Fatal("previous unrestricted rule still running")
+			if len(e.RunningRules()) != 1 || e.EffectiveConfig().ConfigVersion != 1 {
+				t.Fatal("previous working rule/snapshot was lost")
 			}
 			conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
-			if err == nil {
-				conn.Close()
-				t.Fatal("rejected rule still accepting connections")
+			if err != nil {
+				t.Fatal(err)
 			}
+			exchange(t, conn, "preserved")
+			conn.Close()
 		})
 	}
 }

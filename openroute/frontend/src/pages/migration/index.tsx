@@ -1,3 +1,4 @@
+import { migrationReport } from '../../api/reportAdapters'
 /**
  * 迁移与备份页面（规格书 7.2、7.4、8.15、9.2「迁移」）。
  *
@@ -224,7 +225,7 @@ export default function MigrationPage() {
     }
     setRunning(true)
     try {
-      const batch = await migrationApi.run({
+      const result = await migrationApi.run({
         source,
         dsn: dsn.trim(),
         rename_policy: renamePolicy,
@@ -232,9 +233,13 @@ export default function MigrationPage() {
       })
       setRunOpen(false)
       setRunText('')
-      setActiveBatch(batch)
-      setActiveBatchId(batch.id)
-      message.success(t('migration.runStarted'))
+      setReport(migrationReport(result.report))
+      if (result.batch_id) {
+        setActiveBatch(await migrationApi.getOne(result.batch_id))
+        setActiveBatchId(result.batch_id)
+      }
+      if (result.passed) message.success(dryRun ? t('migration.precheckDone') : '迁移已完成')
+      else message.warning('迁移校验未通过，请查看报告')
       await loadBatches()
     } catch (err) {
       showApiError(err, t('migration.runFailed'))

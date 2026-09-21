@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -57,6 +59,8 @@ const (
 //   - RuleID / UserID / NodeID 任一为 0 表示该维度未知，仍会落库以便站点级汇总；
 //   - Direction 取 model.DirectionIn / DirectionOut，非法值归一化为 in。
 type TrafficSample struct {
+	// ExactBytes preserves an explicitly zero multiplier instead of applying the legacy fallback.
+	ExactBytes bool
 	// Hour 指定该增量所属的小时（0~23）。
 	// 传 model.HourDaily(-1) 表示「只写按天聚合行」，用于调用方已自行汇总的场景。
 	Hour int
@@ -160,11 +164,14 @@ func (s *TrafficService) Limit() *LimitService { return s.limit }
 //
 // 参数 ctx 为上下文；samples 为流量增量列表。返回错误。
 func (s *TrafficService) Record(ctx context.Context, samples []TrafficSample) error {
+	return s.app.DB.Tx(ctx, func(tx *gorm.DB) error { return s.recordTraffic(ctx, tx, samples, timeNow()) })
+}
+
+func (s *TrafficService) recordTraffic(ctx context.Context, tx *gorm.DB, samples []TrafficSample, now time.Time) error {
 	if len(samples) == 0 {
 		return nil
 	}
 
-	now := timeNow()
 	date := now.Format("2006-01-02")
 
 	ruleIn := make(map[uint64]int64)
@@ -189,8 +196,14 @@ func (s *TrafficService) Record(ctx context.Context, samples []TrafficSample) er
 		}
 	}
 
+	var totalRaw, totalBytes int64
 	for _, raw := range samples {
 		sp := normalizeSample(raw)
+		if totalRaw > math.MaxInt64-sp.RawBytes || totalBytes > math.MaxInt64-sp.Bytes {
+			return errors.New("流量批次增量溢出")
+		}
+		totalRaw += sp.RawBytes
+		totalBytes += sp.Bytes
 		if sp.RawBytes == 0 && sp.Bytes == 0 {
 			// 零增量不落库，避免制造大量无意义的零行把表撑大。
 			continue
@@ -218,15 +231,16 @@ func (s *TrafficService) Record(ctx context.Context, samples []TrafficSample) er
 
 	// 明细写入：小时行与天行都走 database.UpsertTraffic 的跨方言累加路径。
 	// 唯一键包含 hour 列，因此 -1 与 0~23 天然落在不同行，不会互相覆盖。
-	if err := s.app.DB.UpsertTraffic(ctx, hourRows); err != nil {
+	txdb := &database.DB{DB: tx, Dialect: s.app.DB.Dialect}
+	if err := txdb.UpsertTraffic(ctx, hourRows); err != nil {
 		return response.Wrap(response.CodeDBUnwritable, err, "写入流量小时明细失败")
 	}
-	if err := s.app.DB.UpsertTraffic(ctx, dayRows); err != nil {
+	if err := txdb.UpsertTraffic(ctx, dayRows); err != nil {
 		return response.Wrap(response.CodeDBUnwritable, err, "写入流量天明细失败")
 	}
 
 	// 反规范化计数器：整体放在一个事务里，避免「一半规则更新、一半没更新」。
-	err := s.app.DB.Tx(ctx, func(tx *gorm.DB) error {
+	err := func() error {
 		for id, delta := range ruleIn {
 			if err := s.bumpRuleTraffic(ctx, tx, id, delta, 0); err != nil {
 				return err
@@ -238,16 +252,28 @@ func (s *TrafficService) Record(ctx context.Context, samples []TrafficSample) er
 			}
 		}
 		for id, delta := range userTotal {
-			if err := tx.WithContext(ctx).Model(&model.User{}).Where("id = ?", id).
-				UpdateColumn("traffic_used", gorm.Expr("traffic_used + ?", delta)).Error; err != nil {
-				return err
+			if delta == 0 {
+				continue
+			}
+			result := tx.WithContext(ctx).Model(&model.User{}).Where("id = ? AND traffic_used <= ?", id, math.MaxInt64-delta).
+				UpdateColumn("traffic_used", gorm.Expr("traffic_used + ?", delta))
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				var count int64
+				if err := tx.Model(&model.User{}).Where("id = ?", id).Count(&count).Error; err != nil {
+					return err
+				}
+				if count != 0 {
+					return errors.New("用户流量计数器溢出")
+				}
 			}
 		}
 		return nil
-	})
+	}()
 	if err != nil {
-		// 明细已经落库，计数器失败只影响列表页的展示数字，不应让调用方认为整批失败。
-		s.app.Log.Warn("更新流量计数器失败（明细已落库）", zap.Error(err))
+		return response.Wrap(response.CodeDBUnwritable, err, "更新流量计数器失败")
 	}
 	return nil
 }
@@ -257,11 +283,25 @@ func (s *TrafficService) bumpRuleTraffic(ctx context.Context, tx *gorm.DB, ruleI
 	if in == 0 && out == 0 {
 		return nil
 	}
-	return tx.WithContext(ctx).Model(&model.ForwardRule{}).Where("id = ?", ruleID).
+	result := tx.WithContext(ctx).Model(&model.ForwardRule{}).Where("id = ? AND traffic_in <= ? AND traffic_out <= ?", ruleID, math.MaxInt64-in, math.MaxInt64-out).
+		Where("traffic_in <= ? - traffic_out", math.MaxInt64-in-out).
 		Updates(map[string]interface{}{
 			"traffic_in":  gorm.Expr("traffic_in + ?", in),
 			"traffic_out": gorm.Expr("traffic_out + ?", out),
-		}).Error
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		var count int64
+		if err := tx.Model(&model.ForwardRule{}).Where("id = ?", ruleID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return errors.New("规则流量计数器溢出")
+		}
+	}
+	return nil
 }
 
 // normalizeSample 归一化一条样本的方向、小时与字节口径。
@@ -281,7 +321,7 @@ func normalizeSample(sp TrafficSample) TrafficSample {
 	if sp.Bytes < 0 {
 		sp.Bytes = 0
 	}
-	if sp.Bytes == 0 && sp.RawBytes != 0 {
+	if sp.Bytes == 0 && sp.RawBytes != 0 && !sp.ExactBytes {
 		sp.Bytes = sp.RawBytes
 	}
 	if sp.RawBytes == 0 && sp.Bytes != 0 {
@@ -441,7 +481,7 @@ func (s *TrafficService) periods(ctx context.Context, col, today, yesterday, mon
 // 只用到比较与字符串常量，因此三种方言都成立（规格书 4.1 跨方言约定）。
 func bucketSQL(col string) string {
 	return "CASE WHEN date = ? THEN 'today' WHEN date = ? THEN 'yesterday' " +
-		"WHEN date >= ? THEN 'month' ELSE 'old' END AS bucket, " +
+		"WHEN date >= ? AND date <= ? THEN 'month' ELSE 'old' END AS bucket, " +
 		"direction AS direction, SUM(" + col + ") AS sum_bytes, SUM(raw_bytes) AS sum_raw"
 }
 
@@ -459,8 +499,11 @@ type bucketRow struct {
 // 末尾必须带 AND）；rangeArgs 为三个区间的日期参数，顺序固定为
 // 今日 / 昨日 / 本月起始。只读按天聚合行（hour = -1），避免与小时行重复计数。
 func (s *TrafficService) queryBuckets(ctx context.Context, col, extraWhere string, rangeArgs []interface{}) ([]bucketRow, error) {
-	args := make([]interface{}, 0, len(rangeArgs)+1)
-	args = append(args, rangeArgs...)
+	args := make([]interface{}, 0, len(rangeArgs)+2)
+	// CASE uses today twice: once for its own bucket, once as the month-to-date end.
+	args = append(args, rangeArgs[:3]...)
+	args = append(args, rangeArgs[0])
+	args = append(args, rangeArgs[3:]...)
 	args = append(args, model.HourDaily)
 
 	sqlStr := "SELECT " + bucketSQL(col) + " FROM traffic_logs WHERE " + extraWhere + " hour = ?" +
@@ -504,6 +547,11 @@ type TrafficSeriesPoint struct {
 //
 // 返回按时间升序排列的序列点或错误。
 func (s *TrafficService) Timeseries(ctx context.Context, from, to time.Time, interval, groupBy string, mode BytesMode) ([]TrafficSeriesPoint, error) {
+	return s.TimeseriesFiltered(ctx, from, to, interval, groupBy, mode, TrafficFilter{})
+}
+
+// TimeseriesFiltered applies resource filters before aggregating by any dimension.
+func (s *TrafficService) TimeseriesFiltered(ctx context.Context, from, to time.Time, interval, groupBy string, mode BytesMode, filter TrafficFilter) ([]TrafficSeriesPoint, error) {
 	if mode == "" {
 		mode = BytesModeScaled
 	}
@@ -522,6 +570,7 @@ func (s *TrafficService) Timeseries(ctx context.Context, from, to time.Time, int
 	}
 
 	col := mode.Column()
+	from, to = from.UTC(), to.UTC()
 	hourOnly := interval == HourBucket
 
 	q := s.app.DB.WithContext(ctx).Model(&model.TrafficLog{}).
@@ -534,6 +583,8 @@ func (s *TrafficService) Timeseries(ctx context.Context, from, to time.Time, int
 	} else {
 		q = q.Where("hour = ?", model.HourDaily)
 	}
+	filter.Interval, filter.From, filter.To = interval, from, to
+	q = filter.apply(q)
 	q = q.Group("date, hour, direction, grp")
 
 	var rows []struct {
@@ -553,7 +604,7 @@ func (s *TrafficService) Timeseries(ctx context.Context, from, to time.Time, int
 
 	for _, r := range rows {
 		ts := bucketUnix(r.Date, r.Hour, interval)
-		if ts < from.Unix() || ts > to.Unix() {
+		if ts < from.Truncate(bucketDuration(interval)).Unix() || ts > to.Unix() {
 			// 天聚合行只带日期，按天桶的起点做区间判断已足够精确。
 			continue
 		}
@@ -593,7 +644,20 @@ func (s *TrafficService) Timeseries(ctx context.Context, from, to time.Time, int
 			out[i].GroupName = out[i].Group
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Unix == out[j].Unix {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Unix < out[j].Unix
+	})
 	return out, nil
+}
+
+func bucketDuration(interval string) time.Duration {
+	if interval == DayBucket {
+		return 24 * time.Hour
+	}
+	return time.Hour
 }
 
 // groupColSQL 返回分组维度对应的 SQL 表达式。
@@ -725,6 +789,11 @@ type TrafficRankItem struct {
 //
 // 返回排行列表或错误。
 func (s *TrafficService) Top(ctx context.Context, dimension string, limit int, from, to time.Time, mode BytesMode) ([]TrafficRankItem, error) {
+	return s.TopFiltered(ctx, dimension, limit, from, to, mode, TrafficFilter{})
+}
+
+// TopFiltered uses the same resource filters for ranking and the percentage denominator.
+func (s *TrafficService) TopFiltered(ctx context.Context, dimension string, limit int, from, to time.Time, mode BytesMode, filter TrafficFilter) ([]TrafficRankItem, error) {
 	if mode == "" {
 		mode = BytesModeScaled
 	}
@@ -747,9 +816,9 @@ func (s *TrafficService) Top(ctx context.Context, dimension string, limit int, f
 	}
 
 	bytesCol := mode.Column()
+	from, to = from.UTC(), to.UTC()
 	q := s.app.DB.WithContext(ctx).Model(&model.TrafficLog{}).
-		Select(col+" AS id, direction AS direction, SUM("+bytesCol+") AS sum_bytes, SUM(raw_bytes) AS sum_raw").
-		Where("hour = ?", model.HourDaily).
+		Select(col + " AS id, direction AS direction, SUM(" + bytesCol + ") AS sum_bytes, SUM(raw_bytes) AS sum_raw").
 		Where(col + " > 0").
 		Group(col + ", direction")
 	if !from.IsZero() {
@@ -758,6 +827,9 @@ func (s *TrafficService) Top(ctx context.Context, dimension string, limit int, f
 	if !to.IsZero() {
 		q = q.Where("date <= ?", to.Format("2006-01-02"))
 	}
+
+	filter.From, filter.To = from, to
+	q = filter.apply(q)
 
 	var rows []struct {
 		ID        uint64
@@ -887,6 +959,7 @@ type TrafficFilter struct {
 
 // apply 把筛选条件套用到查询上。
 func (f TrafficFilter) apply(q *gorm.DB) *gorm.DB {
+	f.From, f.To = f.From.UTC(), f.To.UTC()
 	if f.Interval == HourBucket {
 		q = q.Where("hour >= ?", 0)
 	} else {
@@ -906,9 +979,15 @@ func (f TrafficFilter) apply(q *gorm.DB) *gorm.DB {
 	}
 	if !f.From.IsZero() {
 		q = q.Where("date >= ?", f.From.Format("2006-01-02"))
+		if f.Interval == HourBucket {
+			q = q.Where("(date > ? OR hour >= ?)", f.From.Format("2006-01-02"), f.From.Hour())
+		}
 	}
 	if !f.To.IsZero() {
 		q = q.Where("date <= ?", f.To.Format("2006-01-02"))
+		if f.Interval == HourBucket {
+			q = q.Where("(date < ? OR hour <= ?)", f.To.Format("2006-01-02"), f.To.Hour())
+		}
 	}
 	return q
 }
@@ -1371,8 +1450,12 @@ func accumulatePeriods(today, yesterday, month, total *TrafficPeriod, rows []buc
 		switch r.Bucket {
 		case "today":
 			acc(today, r.Direction, r.SumBytes, r.SumRaw)
+			acc(month, r.Direction, r.SumBytes, r.SumRaw)
 		case "yesterday":
 			acc(yesterday, r.Direction, r.SumBytes, r.SumRaw)
+			if ydayStr >= monthStart {
+				acc(month, r.Direction, r.SumBytes, r.SumRaw)
+			}
 		case "month":
 			acc(month, r.Direction, r.SumBytes, r.SumRaw)
 		}
@@ -1421,6 +1504,15 @@ func (s *TrafficService) UserBreakdown(ctx context.Context, userID uint64, mode 
 		}
 		return nil, response.Wrap(response.CodeInternal, err, "查询用户失败")
 	}
+	limit := user.TrafficLimit
+	if limit == 0 && user.GroupID > 0 {
+		var group model.UserGroup
+		err := s.app.DB.WithContext(ctx).Select("traffic_limit").First(&group, user.GroupID).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, response.Wrap(response.CodeInternal, err, "查询用户组流量上限失败")
+		}
+		limit = group.TrafficLimit
+	}
 
 	out := &UserTraffic{
 		UserID:    user.ID,
@@ -1428,15 +1520,15 @@ func (s *TrafficService) UserBreakdown(ctx context.Context, userID uint64, mode 
 		Nickname:  user.Nickname,
 		Status:    user.Status,
 		Used:      user.TrafficUsed,
-		Limit:     user.TrafficLimit,
+		Limit:     limit,
 		Remaining: -1,
 	}
-	if user.TrafficLimit > 0 {
-		out.Remaining = user.TrafficLimit - user.TrafficUsed
+	if limit > 0 {
+		out.Remaining = limit - user.TrafficUsed
 		if out.Remaining < 0 {
 			out.Remaining = 0
 		}
-		out.Percent = float64(user.TrafficUsed) * 100 / float64(user.TrafficLimit)
+		out.Percent = float64(user.TrafficUsed) * 100 / float64(limit)
 	}
 
 	now := timeNow()

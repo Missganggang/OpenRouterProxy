@@ -132,7 +132,6 @@ func main() {
 
 	// 初始化配置版本号：取数据库中的最大规则 updated_at 作为起点，
 	// 保证重启后节点上报的 config_version 仍能正确比较。
-	a.SetConfigVersion(0)
 
 	// 7. 用户表为空时创建管理员。
 	if err := ensureAdmin(ctx, a); err != nil {

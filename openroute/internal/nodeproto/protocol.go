@@ -34,6 +34,7 @@ type Env struct {
 // token 放在 body 里而不是请求头，因为注册阶段节点还没有其它身份信息，
 // 且安装脚本已经把 token 写进了 config.yml。
 type RegisterRequest struct {
+	DisableExecute bool `json:"disable_execute"`
 	// Token 节点密钥，必填。
 	Token string `json:"token"`
 	// Version 节点客户端版本，如 nc20260101。
@@ -87,7 +88,9 @@ type RegisterResponse struct {
 //
 // metrics 子对象的字段名与示例逐字对应，不做任何重命名。
 type HeartbeatRequest struct {
-	NodeID uint64 `json:"node_id"`
+	DisableExecute bool   `json:"disable_execute"`
+	ConfigHash     string `json:"config_hash,omitempty"`
+	NodeID         uint64 `json:"node_id"`
 	// Version 节点客户端版本。
 	Version string `json:"version"`
 	// ConfigVersion 节点当前生效的配置版本；面板据此判断是否需要下发新配置。
@@ -136,8 +139,9 @@ type HeartbeatMetrics struct {
 
 // RunningRule 是节点上报的运行中规则摘要。
 type RunningRule struct {
-	RuleID uint64 `json:"rule_id"`
-	Port   int    `json:"port"`
+	ConfigHash string `json:"config_hash,omitempty"`
+	RuleID     uint64 `json:"rule_id"`
+	Port       int    `json:"port"`
 	// Status 运行状态：running / stopped / error。
 	Status string `json:"status"`
 	// Conn 当前连接数。
@@ -164,6 +168,9 @@ type HeartbeatResponse struct {
 
 // ConfigResponse 是面板下发给节点的配置报文（规格书 8.16 配置响应）。
 type ConfigResponse struct {
+	NodeID       uint64        `json:"node_id"`
+	NodeDisabled bool          `json:"node_disabled"`
+	Listeners    NodeListeners `json:"listeners"`
 	// ConfigVersion 本次配置的版本号。
 	ConfigVersion int64 `json:"config_version"`
 	// Full 为 true 表示全量配置，节点应清空旧规则后重建；false 表示增量。
@@ -182,8 +189,11 @@ type ConfigResponse struct {
 
 // ConfigRule 是下发给节点的一条转发规则。
 type ConfigRule struct {
-	RuleID uint64 `json:"rule_id"`
-	Name   string `json:"name"`
+	TunnelToken string     `json:"tunnel_token,omitempty"`
+	UserID      uint64     `json:"user_id"`
+	UserLimits  UserLimits `json:"user_limits"`
+	RuleID      uint64     `json:"rule_id"`
+	Name        string     `json:"name"`
 	// IsOutbound 标记该规则在当前节点上是入口侧还是出口侧视角。
 	IsOutbound bool `json:"is_outbound"`
 	// InboundGroupID / OutboundGroupID 参与两端协作的节点需要知道对端组。
@@ -263,9 +273,12 @@ type DeviceGroupConfig struct {
 // > IPv6 组策略 > 动态 IPv6 > 回退公网 IPv4。面板在生成时已经解析完毕，
 // 节点直接使用 Host / Port 即可。
 type GroupPeer struct {
-	NodeID uint64 `json:"node_id"`
-	Name   string `json:"name"`
-	Host   string `json:"host"`
+	TLSPin      string `json:"tls_pin,omitempty"`
+	CurrentConn int    `json:"current_conn"`
+	MaxConn     int    `json:"max_conn"`
+	NodeID      uint64 `json:"node_id"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
 	// 各协议端口。
 	DirectPort int  `json:"direct_port"`
 	WsPort     int  `json:"ws_port"`
@@ -282,7 +295,8 @@ type GroupPeer struct {
 
 // ReportRequest 是节点上报同步结果、连接数与错误日志的请求体（规格书 5.1）。
 type ReportRequest struct {
-	NodeID uint64 `json:"node_id"`
+	BatchID string `json:"batch_id,omitempty"`
+	NodeID  uint64 `json:"node_id"`
 	// ConfigVersion 本次应用（成功或失败）的配置版本。
 	ConfigVersion int64 `json:"config_version"`
 	// Results 各规则的同步结果。
@@ -315,6 +329,7 @@ type ReportStats struct {
 
 // RuleTrafficItem 是单条规则的流量增量。
 type RuleTrafficItem struct {
+	Direction  string `json:"direction,omitempty"`
 	RuleID     uint64 `json:"rule_id"`
 	TrafficIn  int64  `json:"traffic_in"`
 	TrafficOut int64  `json:"traffic_out"`
@@ -322,6 +337,7 @@ type RuleTrafficItem struct {
 
 // ReportResponse 是上报响应体。
 type ReportResponse struct {
+	BatchID string `json:"batch_id,omitempty"`
 	// Accepted 面板接受的结果条数。
 	Accepted int `json:"accepted"`
 	// ServerTime 面板当前时间（Unix 秒）。

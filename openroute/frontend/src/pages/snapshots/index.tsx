@@ -11,7 +11,7 @@
  * 规格书 6.13 明确要求「回滚前 MUST 再生成一份回滚前快照，保证可逆」，
  * 因此回滚弹窗里必须把这一点讲清楚，用户才敢点。
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   App,
@@ -87,7 +87,7 @@ export default function SnapshotsPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await systemApi.snapshots({ page: 1, page_size: 200, sort: 'created_at', order: 'desc' })
+      const res = await systemApi.snapshots({ limit: 200 })
       setItems(res.items)
     } catch (err) {
       showApiError(err, t('snapshot.loadFailed'))
@@ -95,6 +95,8 @@ export default function SnapshotsPage() {
       setLoading(false)
     }
   }, [t])
+
+  useEffect(() => { void load() }, [load])
 
   /** 生成快照。 */
   const create = async () => {

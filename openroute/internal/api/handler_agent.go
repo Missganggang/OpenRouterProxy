@@ -2,16 +2,20 @@ package api
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/openroute/openroute/internal/agent"
 	"github.com/openroute/openroute/internal/api/response"
+	"github.com/openroute/openroute/internal/app"
 )
 
 // registry 返回节点通信的处理器注册表（规格书 8.16）。
@@ -123,6 +127,24 @@ func (h *Handlers) NodeBinary(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "application/octet-stream")
+	digest := sha256.New()
+	if _, err := io.Copy(digest, f); err != nil {
+		response.Fail(c, response.New(response.CodeInternal, "读取客户端校验值失败"))
+		return
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		response.Fail(c, response.New(response.CodeInternal, "读取客户端失败"))
+		return
+	}
+	c.Header("X-Checksum-SHA256", hex.EncodeToString(digest.Sum(nil)))
+	binaryVersion := "dev"
+	if app.BuildStamp != "dev" {
+		binaryVersion = "nc" + app.BuildStamp
+	}
+	if data, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "version.txt")); err == nil {
+		binaryVersion = strings.TrimSpace(string(data))
+	}
+	c.Header("X-Node-Version", binaryVersion)
 	c.Header("Content-Disposition", `attachment; filename="rel_nodeclient"`)
 	c.Header("Cache-Control", "no-cache")
 	http.ServeContent(c.Writer, c.Request, agent.NodeBinaryName, info.ModTime(), f)

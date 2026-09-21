@@ -101,15 +101,12 @@ func (h *Hub) Subscribe(name string, nodeID uint64) (<-chan Event, func()) {
 // 对于配置变更事件，跳过的订阅者会由节点侧的轮询兜底保证最终一致。
 func (h *Hub) Broadcast(ev Event) {
 	h.mu.RLock()
-	// 复制一份订阅者列表，避免在持锁期间向通道写入造成长时间持锁。
-	targets := make([]*subscriber, 0, len(h.subs))
-	for s := range h.subs {
-		targets = append(targets, s)
-	}
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
 
 	dropped := 0
-	for _, s := range targets {
+	// Sends are nonblocking; retain the read lock so unsubscribe cannot close a
+	// channel between choosing a subscriber and delivering the event.
+	for s := range h.subs {
 		// 节点连接只需要配置变更类事件，其余事件推给浏览器。
 		if s.isNode && ev.Type != "config_changed" {
 			continue

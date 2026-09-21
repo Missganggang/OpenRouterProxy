@@ -45,6 +45,10 @@ func TestClientRegistrationRetryHeartbeatConfigTasksAndRestore(t *testing.T) {
 		if r.URL.Path != "/api/node/register" && r.Header.Get(nodeproto.NodeTokenHeader) != token {
 			t.Error("authenticated request lacks X-Node-Token")
 		}
+		if r.URL.Path == "/api/node/stream" {
+			w.WriteHeader(404)
+			return
+		}
 		if r.URL.Path != "/api/node/register" && r.Header.Get(nodeproto.NodeIDHeader) != "7" {
 			t.Error("node ID header missing")
 		}
@@ -65,11 +69,11 @@ func TestClientRegistrationRetryHeartbeatConfigTasksAndRestore(t *testing.T) {
 		case "/api/node/heartbeat":
 			var req nodeproto.HeartbeatRequest
 			json.NewDecoder(r.Body).Decode(&req)
-			if req.NodeID != 7 || req.ConfigVersion != 1 || req.Version != "test-version" || req.Timestamp <= 0 {
+			if req.NodeID != 7 || (req.ConfigVersion != 1 && req.ConfigVersion != 2) || req.Version != "test-version" || req.Timestamp <= 0 {
 				t.Error("invalid heartbeat")
 			}
 			heartbeats.Add(1)
-			json.NewEncoder(w).Encode(nodeproto.HeartbeatResponse{ConfigVersion: 2, NeedConfig: true, HeartbeatInterval: 1})
+			json.NewEncoder(w).Encode(nodeproto.HeartbeatResponse{ConfigVersion: 2, NeedConfig: req.ConfigVersion != 2, HeartbeatInterval: 1})
 		case "/api/node/config":
 			if r.URL.Query().Get("version") != "0" {
 				t.Error("full config must be requested")
@@ -82,7 +86,7 @@ func TestClientRegistrationRetryHeartbeatConfigTasksAndRestore(t *testing.T) {
 				t.Error("config results were not reported")
 			}
 			reports.Add(1)
-			json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: 1})
+			json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: 1, BatchID: req.BatchID})
 		case "/api/node/tasks":
 			json.NewEncoder(w).Encode(nodeproto.TasksResponse{Tasks: []nodeproto.TaskItem{{TaskID: 99, Type: "exec"}}})
 		case "/api/node/task-result":
@@ -112,13 +116,13 @@ func TestClientRegistrationRetryHeartbeatConfigTasksAndRestore(t *testing.T) {
 	if err := client.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
-	if time.Since(started) < 15*time.Millisecond || registrations.Load() != 3 || heartbeats.Load() != 1 || reports.Load() != 1 || tasks.Load() != 1 {
+	if time.Since(started) < 15*time.Millisecond || registrations.Load() != 3 || heartbeats.Load() < 2 || reports.Load() < 2 || tasks.Load() != 1 {
 		t.Fatal("retry or protocol sequence incomplete")
 	}
 	if !engine.closed {
 		t.Error("engine not closed on cancellation")
 	}
-	if len(engine.configs) != 2 || engine.configs[1].ConfigVersion != 2 {
+	if len(engine.configs) < 2 || engine.configs[1].ConfigVersion != 2 {
 		t.Fatal("full configuration not applied")
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
@@ -148,7 +152,14 @@ func TestClientRegistrationRetryHeartbeatConfigTasksAndRestore(t *testing.T) {
 func TestClientCancelsInflightRegistration(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { close(started); <-release }))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/node/stream" {
+			w.WriteHeader(404)
+			return
+		}
+		close(started)
+		<-release
+	}))
 	defer server.Close()
 	defer close(release)
 	client, err := NewClient(Config{BaseURL: server.URL, Token: "secret", DataDir: t.TempDir()}, "test", log.New(io.Discard, "", 0))
@@ -177,39 +188,56 @@ func TestClientCancelsInflightRegistration(t *testing.T) {
 
 func TestClientRetainsTrafficWhenReportFails(t *testing.T) {
 	var calls int
+	var firstID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		var req nodeproto.ReportRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		if len(req.Results) != 1 {
-			t.Error("lost pending sync result")
-		}
 		if calls == 1 {
+			firstID = req.BatchID
 			w.WriteHeader(503)
 			return
 		}
-		if len(req.Stats.RuleTraffic) != 1 || req.Stats.RuleTraffic[0].TrafficIn != 10 {
-			t.Error("lost pending traffic")
+		want := int64(7)
+		if calls == 2 && req.BatchID != firstID {
+			t.Error("retry changed batch ID")
 		}
-		json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: 1})
+		if calls == 3 {
+			want = 3
+			if req.BatchID == firstID {
+				t.Error("new traffic reused acknowledged batch ID")
+			}
+		}
+		if len(req.Stats.RuleTraffic) != 1 || req.Stats.RuleTraffic[0].TrafficIn != want {
+			t.Errorf("unexpected traffic batch: %+v", req.Stats.RuleTraffic)
+		}
+		json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: len(req.Results), BatchID: req.BatchID})
 	}))
 	defer server.Close()
-	client, err := NewClient(Config{BaseURL: server.URL, Token: "secret", DataDir: t.TempDir()}, "test", log.New(io.Discard, "", 0))
+	cfg := Config{BaseURL: server.URL, Token: "secret", DataDir: t.TempDir()}
+	client, err := NewClient(cfg, "test", log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := &fakeEngine{stats: nodeproto.ReportStats{RuleTraffic: []nodeproto.RuleTrafficItem{{RuleID: 9, TrafficIn: 7}}}}
-	client.engine = engine
+	client.engine = &fakeEngine{stats: nodeproto.ReportStats{RuleTraffic: []nodeproto.RuleTrafficItem{{RuleID: 9, TrafficIn: 7}}}}
 	client.results = []nodeproto.RuleSyncResult{{RuleID: 9, Status: "normal"}}
-	if err := client.report(context.Background()); err == nil {
-		t.Fatal("expected failed report")
+	if client.report(context.Background()) == nil {
+		t.Fatal("expected report failure")
 	}
-	engine.stats.RuleTraffic = []nodeproto.RuleTrafficItem{{RuleID: 9, TrafficIn: 3}}
-	if err := client.report(context.Background()); err != nil {
+	// A new process must resend the frozen batch, while collecting new traffic separately.
+	restored, err := NewClient(cfg, "test", log.New(io.Discard, "", 0))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(client.pendingTraffic) != 0 || len(client.results) != 0 {
-		t.Error("acknowledged results not cleared")
+	restored.engine = &fakeEngine{stats: nodeproto.ReportStats{RuleTraffic: []nodeproto.RuleTrafficItem{{RuleID: 9, TrafficIn: 3}}}}
+	if err := restored.report(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.report(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if restored.outbox != nil || len(restored.pendingTraffic) != 0 {
+		t.Error("acknowledged batches not cleared")
 	}
 }
 
@@ -246,9 +274,13 @@ func TestClientContinuesPeriodicHeartbeats(t *testing.T) {
 				cancel()
 			}
 		case "/api/node/report":
-			json.NewEncoder(w).Encode(nodeproto.ReportResponse{})
+			var req nodeproto.ReportRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			json.NewEncoder(w).Encode(nodeproto.ReportResponse{BatchID: req.BatchID})
 		case "/api/node/tasks":
 			json.NewEncoder(w).Encode(nodeproto.TasksResponse{})
+		case "/api/node/stream":
+			w.WriteHeader(404)
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -270,7 +302,9 @@ func TestClientContinuesPeriodicHeartbeats(t *testing.T) {
 
 func TestClientRetainsPartiallyAcceptedResults(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: 1})
+		var req nodeproto.ReportRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		json.NewEncoder(w).Encode(nodeproto.ReportResponse{Accepted: 1, BatchID: req.BatchID})
 	}))
 	defer server.Close()
 	client, err := NewClient(Config{BaseURL: server.URL, Token: "secret", DataDir: t.TempDir()}, "test", log.New(io.Discard, "", 0))
@@ -281,7 +315,7 @@ func TestClientRetainsPartiallyAcceptedResults(t *testing.T) {
 	if err := client.report(context.Background()); err == nil {
 		t.Error("expected incomplete acknowledgement error")
 	}
-	if len(client.results) != 2 {
+	if client.outbox == nil || len(client.outbox.Results) != 2 {
 		t.Error("partially acknowledged sync results were discarded")
 	}
 }

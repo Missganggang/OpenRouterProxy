@@ -2,6 +2,8 @@ package database
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"time"
 
 	"gorm.io/gorm"
@@ -55,34 +57,58 @@ func (db *DB) UpsertTraffic(ctx context.Context, rows []TrafficUpsert) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	// 分批写入，避免单条 SQL 的参数数量超过 SQLite 的默认上限（999 个变量）。
-	const batchSize = 100
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
+	// PostgreSQL cannot update the same conflict key twice in one INSERT.
+	merged := make([]TrafficUpsert, 0, len(rows))
+	index := map[string]int{}
+	for _, row := range rows {
+		if row.RawBytes < 0 || row.Bytes < 0 {
+			return fmt.Errorf("negative traffic increment")
 		}
-		batch := rows[start:end]
-
-		err := db.DB.WithContext(ctx).Clauses(clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "date"}, {Name: "hour"}, {Name: "user_id"},
-				{Name: "rule_id"}, {Name: "node_id"}, {Name: "direction"},
-			},
-			// 目标行的 raw_bytes 累加上「本批待插入值」。
-			// excluded.<col> 指向冲突行（即本次 INSERT 想写入的那一行）的值，
-			// 三种方言都支持这一引用，因此不需要手写方言分支。
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"raw_bytes":  gorm.Expr("raw_bytes + excluded.raw_bytes"),
-				"bytes":      gorm.Expr("bytes + excluded.bytes"),
-				"updated_at": time.Now().UTC(),
-			}),
-		}).Create(&batch).Error
-		if err != nil {
-			return err
+		key := fmt.Sprintf("%s/%d/%d/%d/%d/%s", row.Date, row.Hour, row.UserID, row.RuleID, row.NodeID, row.Direction)
+		if i, ok := index[key]; ok {
+			if merged[i].RawBytes > math.MaxInt64-row.RawBytes || merged[i].Bytes > math.MaxInt64-row.Bytes {
+				return fmt.Errorf("traffic increment overflow")
+			}
+			merged[i].RawBytes += row.RawBytes
+			merged[i].Bytes += row.Bytes
+		} else {
+			index[key] = len(merged)
+			merged = append(merged, row)
 		}
 	}
-	return nil
+	rows = merged
+	// Insert missing dimensions first, then use a guarded atomic increment. This
+	// has the same behavior on SQLite/MySQL/PostgreSQL, including near int64's
+	// boundary; SQLite must never silently promote an overflowing integer to REAL.
+	return db.Tx(ctx, func(tx *gorm.DB) error {
+		const batchSize = 100
+		for start := 0; start < len(rows); start += batchSize {
+			end := min(start+batchSize, len(rows))
+			batch := append([]TrafficUpsert(nil), rows[start:end]...)
+			for i := range batch {
+				batch[i].RawBytes, batch[i].Bytes = 0, 0
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batch).Error; err != nil {
+				return err
+			}
+		}
+		for _, row := range rows {
+			if row.RawBytes == 0 && row.Bytes == 0 {
+				continue
+			}
+			result := tx.Model(&TrafficUpsert{}).
+				Where("date = ? AND hour = ? AND user_id = ? AND rule_id = ? AND node_id = ? AND direction = ?", row.Date, row.Hour, row.UserID, row.RuleID, row.NodeID, row.Direction).
+				Where("raw_bytes <= ? AND bytes <= ?", math.MaxInt64-row.RawBytes, math.MaxInt64-row.Bytes).
+				Updates(map[string]interface{}{"raw_bytes": gorm.Expr("raw_bytes + ?", row.RawBytes), "bytes": gorm.Expr("bytes + ?", row.Bytes), "updated_at": time.Now().UTC()})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("traffic counter overflow")
+			}
+		}
+		return nil
+	})
 }
 
 // UpsertRow 是通用的「按键幂等写入」辅助，用于系统设置等键值表。

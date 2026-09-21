@@ -1,3 +1,4 @@
+import { snapshotComparison, type SnapshotDiffResponse } from '../reportAdapters'
 /** 系统、设置、审计、任务、告警、快照、API Token 接口（规格书 8.14）。 */
 import { get, getList, post, put, del } from '../client'
 import type {
@@ -55,6 +56,7 @@ export function updateSettings(values: Record<string, unknown>) {
 
 /** 审计日志查询参数。 */
 export interface AuditQuery extends PageQuery {
+  username?: string
   user_id?: number
   action?: string
   resource?: string
@@ -91,8 +93,9 @@ export function alerts(params?: PageQuery) {
 }
 
 /** 告警规则列表。 */
-export function alertRules(params?: PageQuery) {
-  return getList<AlertRule>('/alerts', params as Record<string, unknown>)
+export async function alertRules(params?: PageQuery) {
+  const { rules } = await alerts(params)
+  return { items: rules ?? [] }
 }
 
 /** 创建告警规则。 */
@@ -112,7 +115,7 @@ export function deleteAlert(id: number) {
 
 /** 测试告警通知渠道。 */
 export function testAlert(id: number) {
-  return post<{ channel: string; ok: boolean; error?: string }[]>(`/alerts/${id}/test`)
+  return post<{ type: string; target: string; ok: boolean; error?: string }[]>(`/alerts/${id}/test`)
 }
 
 /** 告警历史列表。 */
@@ -133,7 +136,7 @@ export function testWebhook(url: string) {
 // ───────────────────────── 快照 ─────────────────────────
 
 /** 快照列表。 */
-export function snapshots(params?: PageQuery) {
+export function snapshots(params?: PageQuery & { limit?: number }) {
   return getList<ConfigSnapshot>('/snapshots', params as Record<string, unknown>)
 }
 
@@ -153,12 +156,8 @@ export function deleteSnapshot(id: number) {
 }
 
 /** 快照与当前配置的差异。 */
-export function snapshotDiff(id: number) {
-  return get<{
-    added: string[]
-    removed: string[]
-    changed: Array<{ path: string; from: unknown; to: unknown }>
-  }>(`/snapshots/${id}/diff`)
+export async function snapshotDiff(id: number) {
+  return snapshotComparison(await get<SnapshotDiffResponse>(`/snapshots/${id}/diff`))
 }
 
 /** 一键回滚到快照。 */

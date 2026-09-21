@@ -92,6 +92,8 @@ export interface Node {
   rev_port: number
   group_ids: number[]
   online: boolean
+  disabled: boolean
+  disable_execute: boolean
   last_seen: string | null
   weight: number
   max_conn: number
@@ -554,6 +556,7 @@ export interface AlertRule {
   type: AlertType
   target_id: number
   threshold: number
+  traffic_limit: number
   duration: number
   channels: AlertChannel[]
   silence_for: number

@@ -3,11 +3,15 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/smtp"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -83,13 +87,14 @@ func NewAlertService(a *App) *AlertService {
 
 // AlertRuleInput 是创建 / 更新告警规则的输入。
 type AlertRuleInput struct {
-	Name       string          `json:"name"`
-	Type       string          `json:"type"`
-	TargetID   uint64          `json:"target_id"`
-	Threshold  float64         `json:"threshold"`
-	Duration   int             `json:"duration"`
-	Channels   []model.Channel `json:"channels"`
-	SilenceFor int             `json:"silence_for"`
+	Name         string          `json:"name"`
+	Type         string          `json:"type"`
+	TargetID     uint64          `json:"target_id"`
+	Threshold    float64         `json:"threshold"`
+	TrafficLimit int64           `json:"traffic_limit"`
+	Duration     int             `json:"duration"`
+	Channels     []model.Channel `json:"channels"`
+	SilenceFor   int             `json:"silence_for"`
 	// Enabled 用指针以便区分「未传」（默认启用）与「显式传 false」。
 	Enabled *bool `json:"enabled"`
 }
@@ -130,7 +135,7 @@ func (s *AlertService) ListRules(ctx context.Context) ([]model.AlertRule, error)
 //
 // 参数 ctx；in 为输入。返回创建后的规则或错误。
 func (s *AlertService) CreateRule(ctx context.Context, in AlertRuleInput) (*model.AlertRule, error) {
-	rule, err := s.buildRule(ctx, in)
+	rule, err := s.buildRule(ctx, in, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +157,7 @@ func (s *AlertService) UpdateRule(ctx context.Context, id uint64, in AlertRuleIn
 		return nil, response.Wrap(response.CodeInternal, err, "查询告警规则失败")
 	}
 
-	built, err := s.buildRule(ctx, in)
+	built, err := s.buildRule(ctx, in, id)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +167,7 @@ func (s *AlertService) UpdateRule(ctx context.Context, id uint64, in AlertRuleIn
 	built.LastFiredAt = exist.LastFiredAt
 
 	if err := s.app.DB.WithContext(ctx).Model(&exist).
-		Select("name", "type", "target_id", "threshold", "duration",
+		Select("name", "type", "target_id", "threshold", "traffic_limit", "duration",
 			"channels", "silence_for", "enabled", "last_fired_at").
 		Updates(built).Error; err != nil {
 		return nil, response.Wrap(response.CodeInternal, err, "更新告警规则失败")
@@ -189,7 +194,7 @@ func (s *AlertService) DeleteRule(ctx context.Context, id uint64) error {
 }
 
 // buildRule 校验并组装一条告警规则（创建与更新共用）。
-func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput) (*model.AlertRule, error) {
+func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput, excludeID uint64) (*model.AlertRule, error) {
 	name := trimSpace(in.Name)
 	if name == "" {
 		return nil, response.Field(response.CodeParamInvalid, "name", in.Name, "告警规则名称不能为空")
@@ -202,6 +207,7 @@ func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput) (*model
 	// 名称按归一化比较查重（规格书 4.1 跨方言约定）。
 	var exist []string
 	if err := s.app.DB.WithContext(ctx).Model(&model.AlertRule{}).
+		Where("id <> ?", excludeID).
 		Pluck("name", &exist).Error; err != nil {
 		return nil, response.Wrap(response.CodeInternal, err, "查询告警规则名称失败")
 	}
@@ -210,8 +216,7 @@ func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput) (*model
 			fmt.Sprintf("告警规则名称 %q 与已有规则 %q 重复", name, dup))
 	}
 
-	// 阈值上限校验：百分比类阈值允许超过 100（例如「达到上限的 120% 才告警」），
-	// 但不能是负数；时间类阈值（离线秒数、证书剩余天数）同样不允许为负。
+	// 与 HTTP 输入校验使用相同的百分比范围；时间类阈值不能为负。
 	if in.Threshold < 0 {
 		return nil, response.Field(response.CodeParamOutOfRange, "threshold", in.Threshold,
 			"阈值不能为负数")
@@ -219,6 +224,16 @@ func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput) (*model
 	if in.Duration < 0 {
 		return nil, response.Field(response.CodeParamOutOfRange, "duration", in.Duration,
 			"防抖持续时长不能为负数")
+	}
+	switch in.Type {
+	case model.AlertNodeCPU, model.AlertNodeMem, model.AlertNodeDisk,
+		model.AlertUserTrafficPct, model.AlertRuleTrafficPct, model.AlertNodeTrafficPct:
+		if in.Threshold <= 0 || in.Threshold > 100 {
+			return nil, response.Field(response.CodeParamOutOfRange, "threshold", in.Threshold, "百分比阈值必须大于 0 且不超过 100")
+		}
+	}
+	if (in.Type == model.AlertRuleTrafficPct || in.Type == model.AlertNodeTrafficPct) && in.TrafficLimit <= 0 {
+		return nil, response.Field(response.CodeParamInvalid, "traffic_limit", in.TrafficLimit, "规则/节点流量告警必须设置大于零的流量基准")
 	}
 
 	for _, ch := range in.Channels {
@@ -247,14 +262,15 @@ func (s *AlertService) buildRule(ctx context.Context, in AlertRuleInput) (*model
 	}
 
 	return &model.AlertRule{
-		Name:       name,
-		Type:       in.Type,
-		TargetID:   in.TargetID,
-		Threshold:  in.Threshold,
-		Duration:   in.Duration,
-		Channels:   model.FromAny(in.Channels),
-		SilenceFor: silence,
-		Enabled:    enabled,
+		Name:         name,
+		Type:         in.Type,
+		TargetID:     in.TargetID,
+		Threshold:    in.Threshold,
+		TrafficLimit: in.TrafficLimit,
+		Duration:     in.Duration,
+		Channels:     model.FromAny(in.Channels),
+		SilenceFor:   silence,
+		Enabled:      enabled,
 	}, nil
 }
 
@@ -335,7 +351,7 @@ func (s *AlertService) MarkResolved(ctx context.Context, id uint64) error {
 	}
 
 	// 同步清理进程内的「已触发」状态，避免下一次评估又把它当成新告警。
-	s.clearInflight(rec.RuleID)
+	s.clearInflight(rec.ID)
 
 	// 通知渠道收到「告警恢复」（规格书 8.18 的 alert.resolved）。
 	payload := map[string]interface{}{
@@ -353,15 +369,14 @@ func (s *AlertService) MarkResolved(ctx context.Context, id uint64) error {
 }
 
 // clearInflight 清空指定规则的「已触发」状态。
-func (s *AlertService) clearInflight(ruleID uint64) {
-	prefix := fmt.Sprintf("%d|", ruleID)
+func (s *AlertService) clearInflight(historyID uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k := range s.inflight {
-		if strings.HasPrefix(k, prefix) {
+	for k, id := range s.inflight {
+		if id == historyID {
 			delete(s.inflight, k)
+			delete(s.pending, k)
 		}
-		delete(s.pending, k)
 	}
 }
 
@@ -576,7 +591,7 @@ func (s *AlertService) evalRuleSyncFailed(ctx context.Context, rule *model.Alert
 	firing := len(rules) > allowed
 
 	cond := alertCondition{
-		Key:      condKey(rule.ID, "rule_sync", rule.TargetID),
+		Key:      condKey(rule.ID, "rule", rule.TargetID),
 		Firing:   firing,
 		Level:    model.AlertLevelCritical,
 		Resource: "rule",
@@ -606,9 +621,11 @@ func (s *AlertService) evalRuleSyncFailed(ctx context.Context, rule *model.Alert
 // （未设上限的用户没有百分比可言，因此不产生告警）。
 func (s *AlertService) evalUserTrafficPct(ctx context.Context, rule *model.AlertRule) ([]alertCondition, error) {
 	var users []model.User
-	q := s.app.DB.WithContext(ctx).Model(&model.User{}).Where("traffic_limit > 0")
+	q := s.app.DB.WithContext(ctx).Model(&model.User{}).
+		Select("users.id, users.username, users.traffic_used, CASE WHEN users.traffic_limit = 0 THEN COALESCE(user_groups.traffic_limit, 0) ELSE users.traffic_limit END AS traffic_limit").
+		Joins("LEFT JOIN user_groups ON user_groups.id = users.group_id")
 	if rule.TargetID > 0 {
-		q = q.Where("id = ?", rule.TargetID)
+		q = q.Where("users.id = ?", rule.TargetID)
 	}
 	if err := q.Find(&users).Error; err != nil {
 		return nil, err
@@ -617,6 +634,11 @@ func (s *AlertService) evalUserTrafficPct(ctx context.Context, rule *model.Alert
 	out := make([]alertCondition, 0, len(users))
 	for i := range users {
 		u := users[i]
+		if u.TrafficLimit <= 0 {
+			// Removing a user or group quota also recovers a previously fired alert.
+			out = append(out, alertCondition{Key: condKey(rule.ID, "user", u.ID), Resource: "user", ResourceID: u.ID})
+			continue
+		}
 		pct := float64(u.TrafficUsed) * 100 / float64(u.TrafficLimit)
 		cond := alertCondition{
 			Key:        condKey(rule.ID, "user", u.ID),
@@ -636,12 +658,11 @@ func (s *AlertService) evalUserTrafficPct(ctx context.Context, rule *model.Alert
 	return out, nil
 }
 
-// evalRuleTrafficPct 评估「规则流量百分比」。
-//
-// 规则没有「流量上限」字段，因此百分比的口径定义为
-// 「本规则累计流量 / 全站累计流量 × 100」，
-// 即「这条规则吃掉了全站多大比例的流量」——这也是个人自用下最有意义的用法。
+// evalRuleTrafficPct compares each rule's cumulative billed bytes with the alert quota.
 func (s *AlertService) evalRuleTrafficPct(ctx context.Context, rule *model.AlertRule) ([]alertCondition, error) {
+	if rule.TrafficLimit <= 0 {
+		return nil, fmt.Errorf("请设置规则流量告警的流量基准")
+	}
 	var rules []model.ForwardRule
 	q := s.app.DB.WithContext(ctx).Model(&model.ForwardRule{})
 	if rule.TargetID > 0 {
@@ -650,106 +671,153 @@ func (s *AlertService) evalRuleTrafficPct(ctx context.Context, rule *model.Alert
 	if err := q.Find(&rules).Error; err != nil {
 		return nil, err
 	}
-
-	var siteTotal int64
-	if err := s.app.DB.WithContext(ctx).Model(&model.ForwardRule{}).
-		Select("COALESCE(SUM(traffic_in + traffic_out), 0) AS total").
-		Scan(&siteTotal).Error; err != nil {
-		return nil, err
-	}
-	if siteTotal <= 0 {
-		return nil, nil
-	}
-
 	out := make([]alertCondition, 0, len(rules))
-	for i := range rules {
-		r := rules[i]
-		pct := float64(r.TrafficIn+r.TrafficOut) * 100 / float64(siteTotal)
-		cond := alertCondition{
-			Key:        condKey(rule.ID, "rule", r.ID),
-			Firing:     pct >= rule.Threshold,
-			Level:      alertLevelByPct(pct, rule.Threshold),
-			Resource:   "rule",
-			ResourceID: r.ID,
-		}
-		if cond.Firing {
-			cond.Title = fmt.Sprintf("规则 %s 占全站流量 %.1f%%", r.Name, pct)
-			cond.Content = fmt.Sprintf("规则 %s（ID %d）累计流量 %s，占全站 %.2f%%，阈值 %.2f%%。",
-				r.Name, r.ID, util.FormatBytes(r.TrafficIn+r.TrafficOut), pct, rule.Threshold)
-		}
-		out = append(out, cond)
+	for _, r := range rules {
+		out = append(out, quotaCondition(rule, "rule", r.ID, "规则 "+r.Name, r.TrafficIn+r.TrafficOut))
 	}
 	return out, nil
 }
 
-// evalNodeTrafficPct 评估「节点流量百分比」。
-//
-// 口径：今日该节点产生的流量 / 今日全站流量 × 100%。
-// 「今日」按 UTC 日期、只读按天聚合行（hour = -1），与流量页口径一致。
+// evalNodeTrafficPct reads daily aggregate rows only, avoiding double counting hourly rows.
 func (s *AlertService) evalNodeTrafficPct(ctx context.Context, rule *model.AlertRule) ([]alertCondition, error) {
-	today := s.now().Format("2006-01-02")
-
+	if rule.TrafficLimit <= 0 {
+		return nil, fmt.Errorf("请设置节点流量告警的流量基准")
+	}
+	nodes, err := s.targetNodes(ctx, rule)
+	if err != nil {
+		return nil, err
+	}
 	type nodeSum struct {
-		NodeID uint64 `gorm:"column:node_id"`
-		Total  int64  `gorm:"column:total"`
+		NodeID uint64
+		Total  int64
 	}
 	var sums []nodeSum
-	if err := s.app.DB.WithContext(ctx).Model(&model.TrafficLog{}).
-		Select("node_id AS node_id, SUM(bytes) AS total").
-		Where("date = ? AND hour = ? AND node_id > 0", today, model.HourDaily).
-		Group("node_id").Scan(&sums).Error; err != nil {
+	q := s.app.DB.WithContext(ctx).Model(&model.TrafficLog{}).
+		Select("node_id, COALESCE(SUM(bytes), 0) AS total").Where("hour = ?", model.HourDaily)
+	if rule.TargetID > 0 {
+		q = q.Where("node_id = ?", rule.TargetID)
+	}
+	if err := q.Group("node_id").Scan(&sums).Error; err != nil {
 		return nil, err
 	}
-
-	var siteTotal int64
-	for _, s2 := range sums {
-		siteTotal += s2.Total
+	totals := make(map[uint64]int64, len(sums))
+	for _, sum := range sums {
+		totals[sum.NodeID] = sum.Total
 	}
-	if siteTotal <= 0 {
-		return nil, nil
+	out := make([]alertCondition, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, quotaCondition(rule, "node", n.ID, "节点 "+n.Name, totals[n.ID]))
 	}
+	return out, nil
+}
 
-	// 节点名一次性查出来，避免逐条查库。
-	nodeIDs := make([]uint64, 0, len(sums))
-	for _, s2 := range sums {
-		nodeIDs = append(nodeIDs, s2.NodeID)
+func quotaCondition(rule *model.AlertRule, resource string, id uint64, name string, used int64) alertCondition {
+	pct := float64(used) * 100 / float64(rule.TrafficLimit)
+	return alertCondition{
+		Key: condKey(rule.ID, resource, id), Firing: pct >= rule.Threshold,
+		Level: alertLevelByPct(pct, rule.Threshold), Resource: resource, ResourceID: id,
+		Title: fmt.Sprintf("%s 流量已达 %.1f%%", name, pct),
+		Content: fmt.Sprintf("%s（ID %d）累计计费流量 %s / 告警基准 %s，达到 %.2f%%，阈值 %.2f%%。",
+			name, id, util.FormatBytes(used), util.FormatBytes(rule.TrafficLimit), pct, rule.Threshold),
 	}
-	names := lookupNames(ctx, s.app, "nodes", "name", nodeIDs)
+}
 
-	out := make([]alertCondition, 0, len(sums))
-	for _, s2 := range sums {
-		if rule.TargetID > 0 && s2.NodeID != rule.TargetID {
+// evalCertExpire checks the panel certificate and user-provided rule TLS certificate chains.
+// TargetID zero includes the panel and all rules; a nonzero target selects one rule.
+func (s *AlertService) evalCertExpire(ctx context.Context, rule *model.AlertRule) ([]alertCondition, error) {
+	out := make([]alertCondition, 0)
+	if rule.TargetID == 0 {
+		panel := alertCondition{Key: condKey(rule.ID, "panel", 0), Resource: "panel"}
+		if s.app.Config.TLSCert != "" {
+			data, err := os.ReadFile(s.app.Config.TLSCert)
+			panel = s.certCondition(rule, "panel", 0, "面板 TLS 证书", data, err)
+		}
+		out = append(out, panel)
+	}
+	var rules []model.ForwardRule
+	q := s.app.DB.WithContext(ctx).Model(&model.ForwardRule{})
+	if rule.TargetID > 0 {
+		q = q.Where("id = ?", rule.TargetID)
+	}
+	if err := q.Find(&rules).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rules {
+		var options struct {
+			TLS struct {
+				Cert json.RawMessage `json:"cert"`
+			} `json:"tls"`
+		}
+		if len(r.Options) == 0 {
+			out = append(out, alertCondition{Key: condKey(rule.ID, "rule", r.ID), Resource: "rule", ResourceID: r.ID})
 			continue
 		}
-		pct := float64(s2.Total) * 100 / float64(siteTotal)
-		cond := alertCondition{
-			Key:        condKey(rule.ID, "node", s2.NodeID),
-			Firing:     pct >= rule.Threshold,
-			Level:      alertLevelByPct(pct, rule.Threshold),
-			Resource:   "node",
-			ResourceID: s2.NodeID,
+		if err := json.Unmarshal(r.Options, &options); err != nil {
+			out = append(out, s.certCondition(rule, "rule", r.ID, "规则 "+r.Name+" TLS 证书", nil, fmt.Errorf("规则 TLS 配置无法解析")))
+			continue
 		}
-		if cond.Firing {
-			cond.Title = fmt.Sprintf("节点 %s 占今日流量 %.1f%%", names[s2.NodeID], pct)
-			cond.Content = fmt.Sprintf("节点 %s（ID %d）今日流量 %s，占全站 %.2f%%，阈值 %.2f%%。",
-				names[s2.NodeID], s2.NodeID, util.FormatBytes(s2.Total), pct, rule.Threshold)
+		raw := options.TLS.Cert
+		var text string
+		var lines []string
+		var parseErr error
+		if len(raw) > 0 && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &text); err != nil {
+				if err = json.Unmarshal(raw, &lines); err != nil {
+					parseErr = fmt.Errorf("证书必须为 PEM 文本或文本行数组")
+				}
+				text = strings.Join(lines, "\n")
+			}
+		}
+		// An absent custom certificate also resolves an alert for a removed certificate.
+		cond := alertCondition{Key: condKey(rule.ID, "rule", r.ID), Resource: "rule", ResourceID: r.ID}
+		if strings.TrimSpace(text) != "" || parseErr != nil {
+			cond = s.certCondition(rule, "rule", r.ID, "规则 "+r.Name+" TLS 证书", []byte(text), parseErr)
 		}
 		out = append(out, cond)
 	}
 	return out, nil
 }
 
-// evalCertExpire 评估「证书即将过期」。
-//
-// 阈值语义：Threshold 为「剩余天数」，默认 30 天。
-//
-// 实现说明（**规格书中本条目未能完全满足，在此显式记录**）：
-// 节点上报结构里没有「证书到期时间」字段，面板侧因此没有权威数据源。
-// 本评估在缺少数据时返回空列表（不产生任何告警），而不是用「节点心跳超时」等
-// 近似指标伪造一个告警——那只会制造噪音。待节点上报结构补齐该字段后，
-// 在这里读取并比较剩余天数即可，调用方无需改动。
-func (s *AlertService) evalCertExpire(_ context.Context, _ *model.AlertRule) ([]alertCondition, error) {
-	return nil, nil
+func (s *AlertService) certCondition(rule *model.AlertRule, resource string, id uint64, name string, data []byte, readErr error) alertCondition {
+	cond := alertCondition{Key: condKey(rule.ID, resource, id), Resource: resource, ResourceID: id, Level: model.AlertLevelWarning}
+	var expiry time.Time
+	err := readErr
+	for err == nil && len(data) > 0 {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		data = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			err = fmt.Errorf("证书格式无效")
+			break
+		}
+		if expiry.IsZero() || cert.NotAfter.Before(expiry) {
+			expiry = cert.NotAfter
+		}
+	}
+	if err != nil || expiry.IsZero() {
+		cond.Firing, cond.Level = true, model.AlertLevelCritical
+		cond.Title = name + " 无法读取或解析"
+		cond.Content = "请检查证书文件或规则 TLS PEM 配置。"
+		return cond
+	}
+	days := expiry.Sub(s.now()).Hours() / 24
+	threshold := rule.Threshold
+	if threshold <= 0 {
+		threshold = 30
+	}
+	cond.Firing = days <= threshold
+	if days <= 0 {
+		cond.Level = model.AlertLevelCritical
+	}
+	cond.Title = fmt.Sprintf("%s 剩余 %.1f 天", name, days)
+	cond.Content = fmt.Sprintf("证书链最早到期时间为 %s，剩余 %.1f 天，告警阈值 %.1f 天。", expiry.UTC().Format(time.RFC3339), days, threshold)
+	return cond
 }
 
 // alertLevelByPct 依据百分比超过阈值的幅度决定级别。
@@ -783,6 +851,17 @@ func (s *AlertService) apply(ctx context.Context, rule *model.AlertRule, cond al
 	s.mu.Lock()
 	// 已触发且仍在持续：交给静默期逻辑处理，防抖不再重复计时。
 	handlerID, wasFiring := s.inflight[cond.Key]
+	if !wasFiring {
+		var active model.AlertHistory
+		err := s.app.DB.WithContext(ctx).Where("rule_id = ? AND resource = ? AND resource_id = ? AND resolved = ?", rule.ID, cond.Resource, cond.ResourceID, false).Order("id DESC").Take(&active).Error
+		if err == nil {
+			handlerID, wasFiring = active.ID, true
+			s.inflight[cond.Key] = active.ID
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			s.mu.Unlock()
+			return 0, err
+		}
+	}
 	firstSeen, hasPending := s.pending[cond.Key]
 
 	if !cond.Firing {
@@ -803,12 +882,12 @@ func (s *AlertService) apply(ctx context.Context, rule *model.AlertRule, cond al
 		return 0, s.refire(ctx, rule, cond, handlerID)
 	}
 
-	if !hasPending {
+	if !hasPending && duration > 0 {
 		s.pending[cond.Key] = now
 		s.mu.Unlock()
 		return 0, nil
 	}
-	if now.Sub(firstSeen) < duration {
+	if hasPending && now.Sub(firstSeen) < duration {
 		s.mu.Unlock()
 		return 0, nil
 	}
@@ -822,14 +901,15 @@ func (s *AlertService) apply(ctx context.Context, rule *model.AlertRule, cond al
 func (s *AlertService) fire(ctx context.Context, rule *model.AlertRule, cond alertCondition) error {
 	now := s.now()
 	rec := model.AlertHistory{
-		RuleID:     rule.ID,
-		Level:      cond.Level,
-		Title:      util.Truncate(cond.Title, 255),
-		Content:    cond.Content,
-		Resolved:   false,
-		Resource:   util.Truncate(cond.Resource, 64),
-		ResourceID: cond.ResourceID,
-		FiredAt:    now,
+		RuleID:         rule.ID,
+		Level:          cond.Level,
+		Title:          util.Truncate(cond.Title, 255),
+		Content:        cond.Content,
+		Resolved:       false,
+		Resource:       util.Truncate(cond.Resource, 64),
+		ResourceID:     cond.ResourceID,
+		FiredAt:        now,
+		LastNotifiedAt: &now,
 	}
 	if err := s.app.DB.WithContext(ctx).Create(&rec).Error; err != nil {
 		return response.Wrap(response.CodeInternal, err, "写入告警历史失败")
@@ -893,8 +973,10 @@ func (s *AlertService) refire(ctx context.Context, rule *model.AlertRule, cond a
 			return nil
 		}
 	}
-	// 静默期以「最近一次通知时间」为准，这里用告警历史的触发时间做近似（误差可控）。
 	last := rec.FiredAt
+	if rec.LastNotifiedAt != nil {
+		last = *rec.LastNotifiedAt
+	}
 	if last.IsZero() {
 		return nil
 	}
@@ -904,7 +986,12 @@ func (s *AlertService) refire(ctx context.Context, rule *model.AlertRule, cond a
 
 	s.app.Log.Debug("告警仍在持续，静默期已过，重新通知",
 		zap.Uint64("rule_id", rule.ID), zap.String("key", cond.Key))
-	s.notifyChannels(ctx, rule.ID, cond.Level, "[持续] "+cond.Title, cond.Content, false)
+	now := s.now()
+	if err := s.app.DB.WithContext(ctx).Model(&rec).Update("last_notified_at", now).Error; err != nil {
+		return err
+	}
+	s.webhook.SendAlertFired(map[string]interface{}{"alert_id": alertID, "rule_id": rule.ID, "title": cond.Title, "content": cond.Content, "ongoing": true})
+	s.notifyChannels(ctx, rule.ID, cond.Level, "[持续] "+cond.Title, cond.Content, true)
 	return nil
 }
 
@@ -913,6 +1000,19 @@ func (s *AlertService) resolve(ctx context.Context, rule *model.AlertRule, cond 
 	now := s.now()
 	if alertID == 0 {
 		return nil
+	}
+	var original model.AlertHistory
+	if err := s.app.DB.WithContext(ctx).First(&original, alertID).Error; err != nil {
+		return err
+	}
+	if cond.Title == "" {
+		cond.Title = original.Title
+	}
+	if cond.Content == "" {
+		cond.Content = original.Content
+	}
+	if cond.Level == "" {
+		cond.Level = original.Level
 	}
 	res := s.app.DB.WithContext(ctx).Model(&model.AlertHistory{}).
 		Where("id = ? AND resolved = ?", alertID, false).
@@ -968,6 +1068,14 @@ func (s *AlertService) notifyChannels(ctx context.Context, ruleID uint64, level,
 		return
 	}
 	for _, ch := range rule.ChannelList() {
+		if ch.Type == "webhook" {
+			event := EventAlertResolved
+			if isFiring {
+				event = EventAlertFired
+			}
+			s.webhook.SendAsync(ch.URL, event, map[string]interface{}{"level": level, "title": title, "content": content})
+			continue
+		}
 		if err := s.sendChannel(ctx, ch, level, title, content, isFiring); err != nil {
 			s.app.Log.Warn("告警通知发送失败",
 				zap.Uint64("rule_id", ruleID), zap.String("channel", ch.Type), zap.Error(err))

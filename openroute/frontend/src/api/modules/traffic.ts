@@ -22,6 +22,7 @@ export interface TrafficFilter {
   rule_id?: number
   node_id?: number
   direction?: 'in' | 'out'
+  raw?: boolean
 }
 
 /**
@@ -75,19 +76,19 @@ export async function timeseries(filter?: TrafficFilter): Promise<{ points: Traf
 }
 
 /** Top-N 排行。 */
-export async function top(params: {
+export async function top(params: TrafficFilter & {
   dimension: 'user' | 'rule' | 'node'
   limit?: number
   from?: string
   to?: string
 }): Promise<TrafficTopItem[]> {
-  const res = await get<TrafficTopResult>('/traffic/top', params as Record<string, unknown>)
+  const res = await get<TrafficTopResult>('/traffic/top', { ...params })
   return res?.items ?? []
 }
 
 /** 导出 CSV。 */
 export function exportCSV(filter?: TrafficFilter) {
-  return download('/api/v1/traffic/export', filter as Record<string, unknown>, 'traffic.csv')
+  return download('/traffic/export', filter as Record<string, unknown>, 'traffic.csv')
 }
 
 /** 首页仪表盘聚合数据（一次请求拿全）。 */

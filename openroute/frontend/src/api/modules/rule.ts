@@ -102,15 +102,11 @@ export async function traffic(
   id: number,
   params?: { from?: string; to?: string; interval?: 'hour' | 'day' },
 ): Promise<{ points: TrafficPoint[] }> {
-  const res = await get<TrafficSeriesResult | { points?: TrafficPoint[] }>(
+  const res = await get<{ series: TrafficSeriesResult['items'] }>(
     `/forward-rules/${id}/traffic`,
     params as Record<string, unknown>,
   )
-  // 兼容两种可能的返回：带 items 的明细结构，或已经折算好的 points。
-  if (res && 'items' in res) {
-    return { points: toPoints((res as TrafficSeriesResult).items) }
-  }
-  return { points: (res as { points?: TrafficPoint[] })?.points ?? [] }
+  return { points: toPoints(res?.series) }
 }
 
 /** 规则当前会话列表。 */
@@ -150,7 +146,7 @@ export function exportRules(params?: RuleQuery) {
 
 /** 下载规则导出文件。 */
 export function downloadExport(params?: RuleQuery) {
-  return download('/api/v1/forward-rules/export', params as Record<string, unknown>, 'rules.json')
+  return download('/forward-rules/export', params as Record<string, unknown>, 'rules.json')
 }
 
 // ───────────────────────── 规则分组 ─────────────────────────

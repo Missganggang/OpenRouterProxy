@@ -5,9 +5,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openroute/openroute/internal/api/middleware"
 
 	"github.com/openroute/openroute/internal/api/response"
 	"github.com/openroute/openroute/internal/app"
+	"github.com/openroute/openroute/internal/model"
 )
 
 // 本文件实现规格书 8.12「流量统计接口」与 6.10 的三个统计维度的读取入口。
@@ -56,7 +58,7 @@ func trafficFilter(c *gin.Context) app.TrafficFilter {
 		direction = ""
 	}
 
-	return app.TrafficFilter{
+	filter := app.TrafficFilter{
 		From:      from,
 		To:        to,
 		UserID:    queryUint64(c, "user_id", 0),
@@ -67,6 +69,10 @@ func trafficFilter(c *gin.Context) app.TrafficFilter {
 		Page:      page,
 		PageSize:  pageSize,
 	}
+	if !middleware.IsAdmin(c) {
+		filter.UserID = middleware.CurrentUserID(c)
+	}
+	return filter
 }
 
 // TrafficOverview 返回全站流量概览（规格书 8.12 GET /traffic/overview）。
@@ -74,6 +80,15 @@ func trafficFilter(c *gin.Context) app.TrafficFilter {
 // 响应包含今日 / 昨日 / 本月 / 累计四个区间的流量、在线用户数、
 // 在线与总节点数、规则数与当前活跃连接数，供首页卡片一次渲染完成。
 func (h *Handlers) TrafficOverview(c *gin.Context) {
+	if !middleware.IsAdmin(c) {
+		ov, err := h.ownTrafficOverview(c)
+		if err != nil {
+			response.Fail(c, err)
+			return
+		}
+		response.OK(c, ov)
+		return
+	}
 	ov, err := h.app.Traffic.Overview(c.Request.Context(), bytesMode(c))
 	if err != nil {
 		response.Fail(c, err)
@@ -104,23 +119,12 @@ func (h *Handlers) TrafficTimeseries(c *gin.Context) {
 	groupBy := normalizeTrafficGroupBy(c.Query("group_by"))
 	mode := bytesMode(c)
 
-	series, err := h.app.Traffic.Timeseries(ctx, from, to, interval, groupBy, mode)
+	series, err := h.app.Traffic.TimeseriesFiltered(ctx, from, to, interval, groupBy, mode, trafficFilter(c))
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
 
-	// 维度过滤：service 的时间序列接口不接受「某个用户」这类过滤条件，
-	// 因此这里在结果集上做一次裁剪，并重算总量与占比。
-	if uid := queryUint64(c, "user_id", 0); uid > 0 {
-		series = filterSeriesByGroup(series, utoa(uid))
-	}
-	if rid := queryUint64(c, "rule_id", 0); rid > 0 {
-		series = filterSeriesByGroup(series, utoa(rid))
-	}
-	if nid := queryUint64(c, "node_id", 0); nid > 0 {
-		series = filterSeriesByGroup(series, utoa(nid))
-	}
 	if series == nil {
 		series = []app.TrafficSeriesPoint{}
 	}
@@ -199,7 +203,7 @@ func (h *Handlers) TrafficTop(c *gin.Context) {
 		to = v
 	}
 
-	list, err := h.app.Traffic.Top(c.Request.Context(), dimension, limit, from, to, bytesMode(c))
+	list, err := h.app.Traffic.TopFiltered(c.Request.Context(), dimension, limit, from, to, bytesMode(c), trafficFilter(c))
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -239,10 +243,47 @@ func (h *Handlers) TrafficExport(c *gin.Context) {
 // 设计目的：首页一次请求拿全概览、排行、趋势与待处理事项，
 // 避免前端并行发起五六个请求导致首屏抖动。
 func (h *Handlers) Dashboard(c *gin.Context) {
+	if !middleware.IsAdmin(c) {
+		ctx := c.Request.Context()
+		ov, err := h.ownTrafficOverview(c)
+		if err != nil {
+			response.Fail(c, err)
+			return
+		}
+		filter := app.TrafficFilter{UserID: middleware.CurrentUserID(c)}
+		now := time.Now().UTC()
+		trend, err := h.app.Traffic.TimeseriesFiltered(ctx, now.Add(-24*time.Hour), now, app.HourBucket, app.GroupByDirection, bytesMode(c), filter)
+		if err != nil {
+			response.Fail(c, err)
+			return
+		}
+		top, err := h.app.Traffic.TopFiltered(ctx, app.DimensionRule, 10, now.Truncate(24*time.Hour), now, bytesMode(c), filter)
+		if err != nil {
+			response.Fail(c, err)
+			return
+		}
+		response.OK(c, &app.DashboardData{Overview: ov, Trend: trend, TopRules: top, TopUsers: []app.TrafficRankItem{}, TopNodes: []app.TrafficRankItem{}, SyncFailedRules: []app.DashboardRuleBrief{}, OfflineNodes: []app.DashboardNodeBrief{}, ActiveAlerts: []model.AlertHistory{}})
+		return
+	}
 	data, err := h.app.Traffic.Dashboard(c.Request.Context(), bytesMode(c))
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
 	response.OK(c, data)
+}
+
+func (h *Handlers) ownTrafficOverview(c *gin.Context) (*app.TrafficOverview, error) {
+	uid := middleware.CurrentUserID(c)
+	user, err := h.app.Traffic.UserBreakdown(c.Request.Context(), uid, bytesMode(c))
+	if err != nil {
+		return nil, err
+	}
+	ov := &app.TrafficOverview{Today: user.Today, Yesterday: user.Yesterday, Month: user.Month, Total: user.Total, TotalRules: user.Rules, BytesMode: bytesMode(c), Timezone: "UTC"}
+	var active int64
+	if err := h.app.DB.WithContext(c.Request.Context()).Model(&model.ForwardRule{}).Where("user_id = ? AND enable = ?", uid, true).Count(&active).Error; err != nil {
+		return nil, err
+	}
+	ov.ActiveRules = int(active)
+	return ov, nil
 }

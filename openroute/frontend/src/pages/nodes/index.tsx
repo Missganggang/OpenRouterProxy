@@ -368,17 +368,13 @@ export default function NodesPage() {
     }
   }
 
-  /** 批量禁用。
-   *
-   *  后端没有独立的批处理接口，这里退化为逐节点 PUT：
-   *  权重置 0、连接上限置 0，等价于「面板侧不再往这台机器上调度」。
-   */
+  /** 批量停用节点的转发能力；保留监控连接。 */
   async function batchDisable() {
     if (selectedIds.length === 0) return
     setRunning(true)
     try {
       const settled = await Promise.allSettled(
-        selectedIds.map((id) => nodeApi.update(id, { weight: 0, max_conn: 0 })),
+        selectedIds.map((id) => nodeApi.update(id, { disabled: true })),
       )
       const succeeded: number[] = []
       const failed: Array<{ id: number; reason: string }> = []
@@ -473,8 +469,10 @@ export default function NodesPage() {
       status: {
         title: t('common.status'),
         dataIndex: 'online',
-        width: 96,
-        render: (online: boolean) => (
+        width: 150,
+        render: (online: boolean, node) => (
+          <Space size={4}>
+          {node.disabled && <Tag color="warning">已停用</Tag>}
           <Tag
             color={online ? 'success' : 'default'}
             style={{ marginInlineEnd: 0 }}
@@ -482,6 +480,7 @@ export default function NodesPage() {
           >
             {online ? t('node.online') : t('node.offline')}
           </Tag>
+          </Space>
         ),
       },
       last_seen: {
@@ -599,6 +598,13 @@ export default function NodesPage() {
         width: 210,
         render: (_v, node) => (
           <div className="or-actions">
+            <Tooltip title={node.disabled ? '启用节点转发' : '停用节点转发'}>
+              <Popconfirm title={node.disabled ? '启用此节点？' : '停用此节点的转发？'} onConfirm={async () => {
+                try { await nodeApi.update(node.id, { disabled: !node.disabled }); await refresh() } catch (error) { showApiError(error) }
+              }}>
+                <Button type="text" size="small" danger={!node.disabled} icon={<PoweroffOutlined />} />
+              </Popconfirm>
+            </Tooltip>
             <Tooltip title={t('common.edit')}>
               <Button type="text" size="small" icon={<EditOutlined />} onClick={() => openEdit(node)} />
             </Tooltip>

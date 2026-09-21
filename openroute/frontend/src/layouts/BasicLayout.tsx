@@ -70,17 +70,17 @@ const MENU_GROUPS: Array<{ titleKey?: string; items: MenuItemDef[] }> = [
   {
     titleKey: 'nav.nodes',
     items: [
-      { key: '/nodes', i18nKey: 'nav.nodes', icon: <CloudServerOutlined /> },
-      { key: '/node-groups', i18nKey: 'nav.nodeGroups', icon: <ClusterOutlined /> },
-      { key: '/monitor', i18nKey: 'nav.monitor', icon: <MonitorOutlined /> },
+      { key: '/nodes', i18nKey: 'nav.nodes', icon: <CloudServerOutlined />, adminOnly: true },
+      { key: '/node-groups', i18nKey: 'nav.nodeGroups', icon: <ClusterOutlined />, adminOnly: true },
+      { key: '/monitor', i18nKey: 'nav.monitor', icon: <MonitorOutlined />, adminOnly: true },
     ],
   },
   {
     titleKey: 'nav.forwardRules',
     items: [
-      { key: '/device-groups', i18nKey: 'nav.deviceGroups', icon: <DeploymentUnitOutlined /> },
+      { key: '/device-groups', i18nKey: 'nav.deviceGroups', icon: <DeploymentUnitOutlined />, adminOnly: true },
       { key: '/forward-rules', i18nKey: 'nav.forwardRules', icon: <ApiOutlined /> },
-      { key: '/rule-groups', i18nKey: 'nav.ruleGroups', icon: <AppstoreOutlined /> },
+      { key: '/rule-groups', i18nKey: 'nav.ruleGroups', icon: <AppstoreOutlined />, adminOnly: true },
     ],
   },
   {
@@ -93,8 +93,8 @@ const MENU_GROUPS: Array<{ titleKey?: string; items: MenuItemDef[] }> = [
   {
     titleKey: 'nav.settings',
     items: [
-      { key: '/alerts', i18nKey: 'nav.alerts', icon: <AlertOutlined /> },
-      { key: '/snapshots', i18nKey: 'nav.snapshots', icon: <HistoryOutlined /> },
+      { key: '/alerts', i18nKey: 'nav.alerts', icon: <AlertOutlined />, adminOnly: true },
+      { key: '/snapshots', i18nKey: 'nav.snapshots', icon: <HistoryOutlined />, adminOnly: true },
       { key: '/migration', i18nKey: 'nav.migration', icon: <DatabaseOutlined />, adminOnly: true },
       { key: '/settings', i18nKey: 'nav.settings', icon: <SettingOutlined />, adminOnly: true },
     ],
@@ -122,7 +122,7 @@ export default function BasicLayout() {
 
   // WebSocket：接收节点上下线事件，实时更新顶栏徽标（规格书 9.3）。
   const { status: wsStatus } = useWebSocket('/api/v1/nodes/stream', {
-    enabled: !!user,
+    enabled: user?.role === 'admin',
     onEvent: (ev) => {
       if (ev.type === 'node_online') {
         setOnlineNodes((n) => (n === null ? null : n + 1))

@@ -38,8 +38,8 @@ import {
   SendOutlined,
 } from '@ant-design/icons'
 
-import { nodeApi, showApiError, systemApi, userApi } from '../../api'
-import type { AlertChannel, AlertHistory, AlertRule, AlertType, Node, User } from '../../api/types'
+import { nodeApi, ruleApi, showApiError, systemApi, userApi } from '../../api'
+import type { AlertChannel, AlertHistory, AlertRule, AlertType, ForwardRule, Node, User } from '../../api/types'
 import { useI18n } from '../../locales'
 import { usePolling } from '../../hooks/usePolling'
 
@@ -89,9 +89,9 @@ const ALERT_TYPE_META: Record<AlertType, AlertTypeMeta> = {
   },
   rule_sync_failed: {
     label: '规则同步失败',
-    unit: '次',
-    hint: '连续同步失败达到该次数即触发',
-    target: 'none',
+    unit: '条',
+    hint: '失败规则条数超过该值即触发；0 表示有一条失败就触发',
+    target: 'rule',
     debounce: false,
   },
   user_traffic_pct: {
@@ -104,22 +104,22 @@ const ALERT_TYPE_META: Record<AlertType, AlertTypeMeta> = {
   rule_traffic_pct: {
     label: '规则流量百分比',
     unit: '%',
-    hint: '规则流量达到其配额的百分比',
-    target: 'none',
+    hint: '规则累计计费流量占本告警流量基准的百分比',
+    target: 'rule',
     debounce: false,
   },
   node_traffic_pct: {
     label: '节点流量百分比',
     unit: '%',
-    hint: '节点流量达到其配额的百分比',
+    hint: '节点累计计费流量占本告警流量基准的百分比',
     target: 'node',
     debounce: false,
   },
   cert_expire: {
     label: '证书即将过期',
     unit: '天',
-    hint: '证书剩余有效期少于该天数即触发',
-    target: 'none',
+    hint: '检查面板和规则自定义 TLS 证书。留空检查全部，也可指定规则。',
+    target: 'rule',
     debounce: false,
   },
 }
@@ -133,6 +133,7 @@ interface AlertFormValues {
   type: AlertType
   target_id?: number
   threshold: number
+  traffic_limit?: number
   duration: number
   silence_for: number
   enabled: boolean
@@ -150,6 +151,7 @@ export default function AlertsPage() {
 
   const [nodes, setNodes] = useState<Node[]>([])
   const [users, setUsers] = useState<User[]>([])
+  const [forwardRules, setForwardRules] = useState<ForwardRule[]>([])
 
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<AlertRule | null>(null)
@@ -202,6 +204,10 @@ export default function AlertsPage() {
       .catch(() => setUsers([]))
   }, [])
 
+  useEffect(() => {
+    void ruleApi.list({ page: 1, page_size: 500 }).then((res) => setForwardRules(res.items)).catch(() => setForwardRules([]))
+  }, [])
+
   const nodeName = (id: number) => nodes.find((n) => n.id === id)?.name ?? (id ? `#${id}` : '-')
   const userName = (id: number) => users.find((u) => u.id === id)?.username ?? (id ? `#${id}` : '-')
 
@@ -228,6 +234,7 @@ export default function AlertsPage() {
       type: r.type,
       target_id: r.target_id || undefined,
       threshold: r.threshold,
+      traffic_limit: r.traffic_limit ? r.traffic_limit / 1024 ** 3 : undefined,
       duration: r.duration,
       silence_for: r.silence_for,
       enabled: r.enabled,
@@ -250,6 +257,7 @@ export default function AlertsPage() {
         type: values.type,
         target_id: values.target_id ?? 0,
         threshold: values.threshold ?? 0,
+        traffic_limit: Math.round((values.traffic_limit ?? 0) * 1024 ** 3),
         duration: values.duration ?? 0,
         silence_for: values.silence_for ?? 0,
         enabled: values.enabled,
@@ -314,11 +322,11 @@ export default function AlertsPage() {
         content: (
           <Table
             size="small"
-            rowKey={(x) => x.channel}
+            rowKey={(x) => `${x.type}:${x.target}`}
             pagination={false}
             dataSource={results}
             columns={[
-              { title: t('alert.channel'), dataIndex: 'channel', key: 'channel', width: 140 },
+              { title: t('alert.channel'), dataIndex: 'type', key: 'type', width: 140 },
               {
                 title: t('common.status'),
                 key: 'ok',
@@ -390,6 +398,9 @@ export default function AlertsPage() {
         if (meta?.target === 'user' && row.target_id) {
           return <Text>{userName(row.target_id)}</Text>
         }
+        if (meta?.target === 'rule' && row.target_id) {
+          return <Text>{forwardRules.find((r) => r.id === row.target_id)?.name ?? `#${row.target_id}`}</Text>
+        }
         return <Text type="secondary">{t('alert.globalScope')}</Text>
       },
     },
@@ -401,6 +412,8 @@ export default function AlertsPage() {
         <Text className="or-mono">
           {row.threshold}
           {ALERT_TYPE_META[row.type]?.unit ?? ''}
+          {!!row.traffic_limit && <div>基准 {(row.traffic_limit / 1024 ** 3).toFixed(2)} GiB</div>}
+          {!row.traffic_limit && (row.type === 'node_traffic_pct' || row.type === 'rule_traffic_pct') && <Tag color="warning">请设置流量基准</Tag>}
         </Text>
       ),
     },
@@ -716,6 +729,10 @@ export default function AlertsPage() {
             <Col span={12}>
               <Form.Item name="type" label={t('alert.type')} rules={[{ required: true }]}>
                 <Select
+                  onChange={(type: AlertType) => form.setFieldsValue({
+                    target_id: undefined,
+                    threshold: type === 'cert_expire' ? 30 : type === 'rule_sync_failed' ? 0 : type === 'node_offline' ? 60 : 80,
+                  })}
                   options={(Object.keys(ALERT_TYPE_META) as AlertType[]).map((k) => ({
                     label: alertTypeLabel(k, t),
                     value: k,
@@ -765,6 +782,8 @@ export default function AlertsPage() {
                       placeholder={t('alert.allUsers')}
                       options={users.map((u) => ({ label: u.username, value: u.id }))}
                     />
+                  ) : ALERT_TYPE_META[alertType].target === 'rule' ? (
+                    <Select allowClear showSearch optionFilterProp="label" placeholder={alertType === 'cert_expire' ? '面板和全部规则证书' : '全部规则'} options={forwardRules.map((r) => ({ label: r.name, value: r.id }))} />
                   ) : (
                     <Select
                       allowClear
@@ -823,6 +842,11 @@ export default function AlertsPage() {
             </Col>
           </Row>
 
+          {(alertType === 'rule_traffic_pct' || alertType === 'node_traffic_pct') && (
+            <Form.Item name="traffic_limit" label="流量告警基准" extra="按累计计费流量计算，每个目标分别使用此基准；此设置不限制转发流量。" rules={[{ required: true, type: 'number', min: 0.000001, message: '请填写大于零的流量基准' }]}>
+              <InputNumber min={0.000001} addonAfter="GiB" style={{ width: '100%' }} />
+            </Form.Item>
+          )}
           <Form.List name="channels">
             {(fields, { add, remove: removeChannel }) => (
               <Space direction="vertical" style={{ width: '100%' }} size={8}>
@@ -956,6 +980,11 @@ function ChannelRow({ name, restField, onRemove, form, t }: ChannelRowProps) {
             <Col span={6}>
               <Form.Item {...restField} name={[name, 'user']} noStyle>
                 <Input placeholder={t('alert.smtpUser')} />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item {...restField} name={[name, 'pass']} noStyle>
+                <Input.Password placeholder="SMTP 密码" />
               </Form.Item>
             </Col>
             <Col span={6}>

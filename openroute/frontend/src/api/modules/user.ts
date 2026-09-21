@@ -85,8 +85,9 @@ export function rules(id: number) {
 // ───────────────────────── 用户分组 ─────────────────────────
 
 /** 用户分组列表。 */
-export function groups(params?: PageQuery) {
-  return getList<UserGroup>('/user-groups', params as Record<string, unknown>)
+export async function groups(params?: PageQuery) {
+  const items = (await get<UserGroup[]>('/user-groups', params as Record<string, unknown>)) ?? []
+  return { items, pagination: { page: 1, page_size: items.length, total: items.length } }
 }
 
 /** 用户分组详情。 */

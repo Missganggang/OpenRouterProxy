@@ -433,7 +433,7 @@ export default function NodeDetailPage() {
                     message={t('terminal.auditHint')}
                     description={t('terminal.auditHintDetail')}
                   />
-                  <Terminal nodeId={nodeId} />
+                  {node?.disable_execute ? <Alert type="warning" showIcon message="此节点已关闭远程命令执行。" /> : <Terminal nodeId={nodeId} />}
                 </div>
               ) : null,
             },
@@ -590,19 +590,19 @@ function OverviewTab({ node }: { node: Node }) {
           <Card size="small" title={t('nodeDetail.ports')}>
             <Space size={6} wrap>
               <Tag className="or-mono" style={{ margin: 0 }}>
-                direct {node.direct_port || '—'}
+                direct {node.direct_port || 28080}
               </Tag>
               <Tag className="or-mono" style={{ margin: 0 }}>
-                ws {node.ws_port || '—'}
+                ws {node.ws_port || 28081}
               </Tag>
               <Tag className="or-mono" style={{ margin: 0 }}>
-                tls {node.tls_port || '—'}
+                tls {node.tls_port || 28082}
               </Tag>
               <Tag className="or-mono" style={{ margin: 0 }}>
-                udp {node.udp_port || '—'}
+                udp {node.udp_port || 28083}
               </Tag>
               <Tag className="or-mono" style={{ margin: 0 }}>
-                rev {node.rev_port || '—'}
+                rev {node.rev_port || 28084}
               </Tag>
             </Space>
           </Card>

@@ -28,11 +28,11 @@ export function remove(id: number) {
 }
 
 /** 分组内的节点。 */
-export function nodes(id: number) {
-  return get<Node[]>(`/node-groups/${id}/nodes`)
+export async function nodes(id: number) {
+  return (await getList<Node>(`/node-groups/${id}/nodes`)).items
 }
 
 /** 导出分组内节点为 CSV。 */
 export function exportCSV(id: number, name: string) {
-  return download(`/api/v1/node-groups/${id}/export`, undefined, `${name}.csv`)
+  return download(`/node-groups/${id}/export`, undefined, `${name}.csv`)
 }

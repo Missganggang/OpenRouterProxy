@@ -87,6 +87,7 @@ interface TokenFormValues {
   name: string
   scopes: string[]
   ip_whitelist?: string[]
+  expire_at?: Dayjs | null
 }
 
 /** 从 URL 参数解析 Tab 键，非法值一律回落到「基础设置」。 */
@@ -481,7 +482,7 @@ function ApiTokenPanel({ t }: TabProps) {
         name: values.name.trim(),
         scopes: values.scopes ?? [],
         ip_whitelist: values.ip_whitelist ?? [],
-        expire_at: null,
+        expire_at: values.expire_at?.toISOString() ?? null,
       })
       setCreateOpen(false)
       form.resetFields()
@@ -739,6 +740,10 @@ function ApiTokenPanel({ t }: TabProps) {
               options={systemApi.ALL_SCOPES.map((s) => ({ label: s, value: s }))}
             />
           </Form.Item>
+          <Form.Item name="expire_at" label={t('settings.tokenExpire')} extra={t('settings.tokenExpireHint')}
+            rules={[{ validator: (_, value: Dayjs | null) => !value || value.valueOf() > Date.now() ? Promise.resolve() : Promise.reject(new Error('过期时间必须晚于当前时间')) }]}>
+            <DatePicker showTime allowClear style={{ width: '100%' }} />
+          </Form.Item>
           <Form.Item
             name="ip_whitelist"
             label={t('settings.tokenIpWhitelist')}
@@ -795,7 +800,7 @@ function NotificationTab({ t }: TabProps) {
     setLoading(true)
     try {
       const settings = await settingApi.getAll()
-      form.setFieldsValue({ webhook: asString(settings.webhook) })
+      form.setFieldsValue({ webhook: asString(settings.webhook_url ?? settings.webhook) })
     } catch (err) {
       showApiError(err, t('settings.loadFailed'))
     } finally {
@@ -838,7 +843,7 @@ function NotificationTab({ t }: TabProps) {
     }
     setSaving(true)
     try {
-      await settingApi.update({ webhook: values.webhook?.trim() ?? '' })
+      await settingApi.update({ webhook_url: values.webhook?.trim() ?? '' })
       message.success(t('settings.saved'))
     } catch (err) {
       showApiError(err, t('settings.saveFailed'))
@@ -1101,7 +1106,7 @@ function AuditTab({ t }: TabProps) {
         action: action.trim() || undefined,
         resource: resource.trim() || undefined,
         result: result || undefined,
-        keyword: username.trim() || undefined,
+        username: username.trim() || undefined,
         from: range?.[0]?.toISOString(),
         to: range?.[1]?.toISOString(),
       })

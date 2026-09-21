@@ -165,6 +165,11 @@ func (s *MigrateService) Run(ctx context.Context, req MigrateRequest) (*MigrateR
 	} else {
 		result.Passed = report.Error == ""
 	}
+	if !req.DryRun && result.Passed && s.app.Alert != nil {
+		s.app.Alert.NotifyEvent(ctx, EventMigrationFinished, map[string]interface{}{
+			"batch_id": result.BatchID, "source": req.From, "migrated_rows": report.MigratedRows,
+		})
+	}
 	return result, nil
 }
 

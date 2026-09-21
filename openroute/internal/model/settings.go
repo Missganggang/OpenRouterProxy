@@ -148,10 +148,11 @@ type AlertRule struct {
 	Name string `gorm:"size:128" json:"name"`
 	// 类型：node_offline | node_cpu | node_mem | node_disk | rule_sync_failed
 	//      | user_traffic_pct | rule_traffic_pct | node_traffic_pct | cert_expire
-	Type      string  `gorm:"size:32;index" json:"type"`
-	TargetID  uint64  `gorm:"index" json:"target_id"`     // 关联节点/用户/规则 ID，0 = 全局
-	Threshold float64 `gorm:"default:0" json:"threshold"` // 阈值（百分比 / 秒数）
-	Duration  int     `gorm:"default:0" json:"duration"`  // 持续时长（秒）后才触发，防抖
+	Type         string  `gorm:"size:32;index" json:"type"`
+	TargetID     uint64  `gorm:"index" json:"target_id"`         // 关联节点/用户/规则 ID，0 = 全局
+	Threshold    float64 `gorm:"default:0" json:"threshold"`     // 阈值（百分比 / 秒数）
+	TrafficLimit int64   `gorm:"default:0" json:"traffic_limit"` // 规则/节点累计计费流量的告警基准（字节），不限制转发
+	Duration     int     `gorm:"default:0" json:"duration"`      // 持续时长（秒）后才触发，防抖
 	// 通知渠道
 	Channels    JSON       `gorm:"type:text" json:"channels"`      // [{"type":"webhook","url":"..."},...]
 	SilenceFor  int        `gorm:"default:300" json:"silence_for"` // 静默期（秒），避免重复轰炸
@@ -216,10 +217,11 @@ type AlertHistory struct {
 	Content  string `gorm:"type:text" json:"content"`
 	Resolved bool   `gorm:"default:false;index" json:"resolved"`
 	// 关联对象，便于前端跳转
-	Resource   string     `gorm:"size:64" json:"resource"`
-	ResourceID uint64     `gorm:"index" json:"resource_id"`
-	FiredAt    time.Time  `gorm:"index" json:"fired_at"`
-	ResolvedAt *time.Time `json:"resolved_at"`
+	Resource       string     `gorm:"size:64" json:"resource"`
+	ResourceID     uint64     `gorm:"index" json:"resource_id"`
+	FiredAt        time.Time  `gorm:"index" json:"fired_at"`
+	LastNotifiedAt *time.Time `json:"last_notified_at"`
+	ResolvedAt     *time.Time `json:"resolved_at"`
 }
 
 // TableName 指定表名。

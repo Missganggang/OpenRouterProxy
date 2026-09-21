@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"gorm.io/gorm/clause"
 
 	"github.com/openroute/openroute/internal/config"
 	"github.com/openroute/openroute/internal/database"
+	"github.com/openroute/openroute/internal/model"
 )
 
 // App 持有全部长生命周期依赖。
@@ -78,6 +80,11 @@ func New(cfg *config.Config, db *database.DB, log *zap.Logger) *App {
 //
 // 返回装配完成的 App 自身，便于链式调用。
 func (a *App) Init() *App {
+	var revision model.ConfigRevision
+	if a.DB != nil {
+		a.DB.Where("id = ?", 1).Find(&revision)
+		a.SetConfigVersion(revision.Revision)
+	}
 	a.wire()
 	return a
 }
@@ -129,6 +136,12 @@ func (a *App) BumpConfigVersion(reason string) int64 {
 	a.versionMu.Lock()
 	a.configVersion++
 	v := a.configVersion
+	if a.DB != nil {
+		row := model.ConfigRevision{ID: 1, Revision: v}
+		if err := a.DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoUpdates: clause.AssignmentColumns([]string{"revision"})}).Create(&row).Error; err != nil {
+			a.Log.Error("持久化配置版本失败", zap.Error(err))
+		}
+	}
 	a.versionMu.Unlock()
 
 	a.Log.Info("配置版本已更新",

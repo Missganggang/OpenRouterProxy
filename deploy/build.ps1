@@ -23,6 +23,7 @@ try {
         New-Item -ItemType Directory -Force $destination | Out-Null
         & go build -trimpath -ldflags "-s -w -X main.version=nc$Version" -o (Join-Path $destination 'rel_nodeclient') ./cmd/nodeclient
         if ($LASTEXITCODE -ne 0) { throw "Node build failed: $arch" }
+		[System.IO.File]::WriteAllText((Join-Path $destination 'version.txt'), "nc$Version", [System.Text.UTF8Encoding]::new($false))
     }
     Write-Host "Built panel and Linux node clients: $Version"
 } finally {

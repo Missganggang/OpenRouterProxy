@@ -483,50 +483,30 @@ func (s *SyncService) ruleCountByNode(ctx context.Context, nodes []model.Node) (
 		return out, nil
 	}
 
-	// 一次取出全部设备组的成员与类型，以及全部规则的关联字段。
-	var groups []model.DeviceGroup
-	if err := s.app.DB.WithContext(ctx).Model(&model.DeviceGroup{}).
-		Select("id, type, node_ids").Find(&groups).Error; err != nil {
-		return nil, response.Wrap(response.CodeInternal, err, "查询设备组失败")
-	}
+	var groupRows []model.DeviceGroup
 	var rules []model.ForwardRule
-	if err := s.app.DB.WithContext(ctx).Model(&model.ForwardRule{}).
-		Select("id, inbound_group_id, outbound_group_id, chain_groups, enable").
-		Find(&rules).Error; err != nil {
-		return nil, response.Wrap(response.CodeInternal, err, "查询规则失败")
+	if err := s.app.DB.WithContext(ctx).Find(&groupRows).Error; err != nil {
+		return nil, err
 	}
-
-	// 组 ID → 规则数。
-	groupRules := make(map[uint64]int, len(groups))
-	for i := range rules {
-		if !rules[i].Enable {
+	if err := s.app.DB.WithContext(ctx).Where("enable = ?", true).Find(&rules).Error; err != nil {
+		return nil, err
+	}
+	groups := map[uint64]*model.DeviceGroup{}
+	for i := range groupRows {
+		groups[groupRows[i].ID] = &groupRows[i]
+	}
+	for _, node := range nodes {
+		if node.Disabled {
 			continue
 		}
-		if rules[i].InboundGroupID > 0 {
-			groupRules[rules[i].InboundGroupID]++
-		}
-		if rules[i].OutboundGroupID > 0 {
-			groupRules[rules[i].OutboundGroupID]++
-		}
-		for _, cid := range rules[i].ChainGroupList() {
-			groupRules[cid]++
+		for i := range rules {
+			in, exit := model.RuleNodeRoles(&rules[i], node.ID, groups)
+			if in || exit {
+				out[node.ID]++
+			}
 		}
 	}
 
-	// 节点 → 组 → 规则数（同一节点属于多个组时取累加，口径偏保守）。
-	nodeGroups := make(map[uint64][]uint64, len(nodes))
-	for i := range groups {
-		for _, nid := range groups[i].NodeIDs.AsUint64Slice() {
-			nodeGroups[nid] = append(nodeGroups[nid], groups[i].ID)
-		}
-	}
-	for _, n := range nodes {
-		total := 0
-		for _, gid := range nodeGroups[n.ID] {
-			total += groupRules[gid]
-		}
-		out[n.ID] = total
-	}
 	return out, nil
 }
 

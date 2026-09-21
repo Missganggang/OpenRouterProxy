@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/openroute/openroute/internal/nodeproto"
@@ -42,8 +43,14 @@ type Client struct {
 	lastConfig         time.Time
 	results            []nodeproto.RuleSyncResult
 	configError        string
-	pendingTraffic     map[uint64]nodeproto.RuleTrafficItem
+	pendingTraffic     map[string]*pendingTrafficBucket
+	outbox             *nodeproto.ReportRequest
 	lastMetrics        nodeproto.HeartbeatMetrics
+	wake               chan struct{}
+	restart            chan struct{}
+	tasks              *taskManager
+	forceConfig        bool
+	now                func() time.Time
 }
 
 func NewClient(config Config, version string, logger *log.Logger) (*Client, error) {
@@ -53,20 +60,43 @@ func NewClient(config Config, version string, logger *log.Logger) (*Client, erro
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Client{
+	c := &Client{
 		config: config, version: version, log: logger,
 		http:   &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		engine: NewEngine(config.BindInbound), metrics: newMetricsCollector(config.CountInterface),
 		interval: time.Duration(nodeproto.HeartbeatIntervalDefault) * time.Second,
 		retryMin: time.Second, retryMax: 30 * time.Second,
-		pendingTraffic: make(map[uint64]nodeproto.RuleTrafficItem),
-	}, nil
+		pendingTraffic: make(map[string]*pendingTrafficBucket), now: time.Now,
+		wake: make(chan struct{}, 1), restart: make(chan struct{}, 1),
+	}
+	if err := c.loadReports(); err != nil {
+		return nil, err
+	}
+	tasks, err := newTaskManager(c)
+	if err != nil {
+		return nil, err
+	}
+	c.tasks = tasks
+	return c, nil
 }
 
 // Run retries panel outages while keeping the last received forwarding rules active.
 // Cancellation interrupts requests and timers, then releases all listeners.
 func (c *Client) Run(ctx context.Context) error {
-	defer c.engine.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); c.streamLoop(ctx) }()
+	go func() { defer workers.Done(); c.tasks.run(ctx) }()
+	defer func() {
+		cancel()
+		workers.Wait()
+		c.engine.Close()
+		c.captureTraffic()
+		if err := c.saveReports(); err != nil {
+			c.log.Printf("persist final traffic: %s", c.safe(err))
+		}
+	}()
 	if err := c.restore(); err != nil && !os.IsNotExist(err) {
 		c.log.Printf("local configuration not restored: %s", c.safe(err))
 	}
@@ -76,6 +106,8 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// Persist samples even when registration/heartbeats cannot reach the panel.
+		c.checkpointTraffic()
 		var err error
 		if !registered {
 			err = c.register(ctx)
@@ -96,7 +128,7 @@ func (c *Client) Run(ctx context.Context) error {
 				registered = false
 			}
 			c.log.Printf("panel communication failed: %s; retry in %s", c.safe(err), backoff)
-			if err := waitContext(ctx, backoff); err != nil {
+			if err := c.wait(ctx, backoff); err != nil {
 				return err
 			}
 			backoff *= 2
@@ -106,14 +138,14 @@ func (c *Client) Run(ctx context.Context) error {
 			continue
 		}
 		backoff = c.retryMin
-		if err := waitContext(ctx, c.interval); err != nil {
+		if err := c.wait(ctx, c.interval); err != nil {
 			return err
 		}
 	}
 }
 
 func (c *Client) register(ctx context.Context) error {
-	request := nodeproto.RegisterRequest{Token: c.config.Token, Version: c.version, System: c.metrics.system(), ConfigVersion: c.configVersion, UUID: c.config.MachineID}
+	request := nodeproto.RegisterRequest{Token: c.config.Token, Version: c.version, System: c.metrics.system(), ConfigVersion: c.configVersion, UUID: c.config.MachineID, DisableExecute: c.config.DisableExecute}
 	var response nodeproto.RegisterResponse
 	if err := c.request(ctx, http.MethodPost, "/api/node/register", request, &response); err != nil {
 		return err
@@ -124,19 +156,25 @@ func (c *Client) register(ctx context.Context) error {
 	c.nodeID = response.NodeID
 	c.setInterval(response.HeartbeatInterval)
 	c.apply(response.Config)
+	if err := c.confirmUpgrade(); err != nil {
+		return err
+	}
+	if err := c.tasks.registered(); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (c *Client) heartbeat(ctx context.Context) error {
 	c.lastMetrics = c.metrics.sample()
-	request := nodeproto.HeartbeatRequest{NodeID: c.nodeID, Version: c.version, ConfigVersion: c.configVersion, Metrics: c.lastMetrics, RunningRules: c.engine.RunningRules(), Timestamp: time.Now().Unix()}
+	request := nodeproto.HeartbeatRequest{NodeID: c.nodeID, Version: c.version, ConfigVersion: c.configVersion, ConfigHash: nodeproto.ConfigHash(c.effectiveConfig()), DisableExecute: c.config.DisableExecute, Metrics: c.lastMetrics, RunningRules: c.engine.RunningRules(), Timestamp: time.Now().Unix()}
 	var response nodeproto.HeartbeatResponse
 	if err := c.request(ctx, http.MethodPost, "/api/node/heartbeat", request, &response); err != nil {
 		return err
 	}
 	c.setInterval(response.HeartbeatInterval)
 	// Periodic full refresh also repairs restored databases whose revision went backwards.
-	if response.NeedConfig || response.ConfigVersion != c.configVersion || time.Since(c.lastConfig) >= 2*time.Minute {
+	if c.forceConfig || response.NeedConfig || response.ConfigVersion != c.configVersion || time.Since(c.lastConfig) >= 2*time.Minute {
 		var cfg nodeproto.ConfigResponse
 		if err := c.request(ctx, http.MethodGet, "/api/node/config?version=0", nil, &cfg); err != nil {
 			return err
@@ -145,12 +183,16 @@ func (c *Client) heartbeat(ctx context.Context) error {
 			return errors.New("panel did not return the requested full configuration")
 		}
 		c.apply(cfg)
+		c.forceConfig = false
 	}
 	// Reports and task polling share a short budget so they cannot starve heartbeats.
 	auxCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if err := c.report(auxCtx); err != nil {
+	if err := c.flushReports(auxCtx); err != nil {
 		c.log.Printf("node report failed: %s", c.safe(err))
+	}
+	if err := c.tasks.report(auxCtx); err != nil {
+		c.log.Printf("task result report failed: %s", c.safe(err))
 	}
 	tasks := response.Tasks
 	if len(tasks) == 0 {
@@ -161,18 +203,14 @@ func (c *Client) heartbeat(ctx context.Context) error {
 		}
 		tasks = pending.Tasks
 	}
-	// Bound task work so unreachable task endpoints cannot indefinitely starve heartbeats.
-	for _, task := range tasks {
-		result := nodeproto.TaskResultRequest{TaskID: task.TaskID, Status: "failed", Result: "This client does not support remote upgrade, restart or command execution; use systemd or reinstall on the node.", Timestamp: time.Now().Unix()}
-		if err := c.request(auxCtx, http.MethodPost, "/api/node/task-result", result, &nodeproto.TaskResultResponse{}); err != nil {
-			c.log.Printf("task result report failed: %s", c.safe(err))
-			break
-		}
-	}
+	c.tasks.submit(tasks)
 	return nil
 }
 
 func (c *Client) apply(cfg nodeproto.ConfigResponse) {
+	// Legacy engines must drain before changing their version; the real engine
+	// records the version and hour with each successful byte write.
+	c.checkpointTraffic()
 	c.results = c.engine.Apply(cfg)
 	c.configVersion = cfg.ConfigVersion
 	c.lastConfig = time.Now()
@@ -184,7 +222,17 @@ func (c *Client) apply(cfg nodeproto.ConfigResponse) {
 			c.configError = "One or more rules failed; see rule synchronization errors."
 		}
 	}
-	data, err := json.Marshal(savedConfig{Identity: c.identity(), Config: cfg})
+	// Cache only the engine's effective state; a rejected change must not replace
+	// a working configuration on disk. Older test engines fall back to all-or-none.
+	effective := cfg
+	if provider, ok := c.engine.(interface {
+		EffectiveConfig() nodeproto.ConfigResponse
+	}); ok {
+		effective = provider.EffectiveConfig()
+	} else if c.configError != "" {
+		return
+	}
+	data, err := json.Marshal(savedConfig{Identity: c.identity(), Config: effective})
 	if err == nil {
 		err = atomicWrite(filepath.Join(c.config.DataDir, "config.json"), data)
 	}
@@ -194,32 +242,41 @@ func (c *Client) apply(cfg nodeproto.ConfigResponse) {
 	}
 }
 
-func (c *Client) report(ctx context.Context) error {
-	stats := c.engine.Stats()
-	for _, delta := range stats.RuleTraffic {
-		pending := c.pendingTraffic[delta.RuleID]
-		pending.RuleID = delta.RuleID
-		pending.TrafficIn += delta.TrafficIn
-		pending.TrafficOut += delta.TrafficOut
-		c.pendingTraffic[delta.RuleID] = pending
+func (c *Client) effectiveConfig() nodeproto.ConfigResponse {
+	if provider, ok := c.engine.(interface {
+		EffectiveConfig() nodeproto.ConfigResponse
+	}); ok {
+		return provider.EffectiveConfig()
 	}
-	stats.RuleTraffic = make([]nodeproto.RuleTrafficItem, 0, len(c.pendingTraffic))
-	for _, pending := range c.pendingTraffic {
-		stats.RuleTraffic = append(stats.RuleTraffic, pending)
+	return nodeproto.ConfigResponse{Full: true, ConfigVersion: c.configVersion}
+}
+
+func (c *Client) notify() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
 	}
-	// The current panel stores these two report fields as byte/s. Heartbeat carries totals.
-	stats.NetIn, stats.NetOut = c.lastMetrics.NetInSpeed, c.lastMetrics.NetOutSpeed
-	request := nodeproto.ReportRequest{NodeID: c.nodeID, ConfigVersion: c.configVersion, Results: c.results, Stats: &stats, Error: c.configError, Timestamp: time.Now().Unix()}
-	var response nodeproto.ReportResponse
-	if err := c.request(ctx, http.MethodPost, "/api/node/report", request, &response); err != nil {
-		return err
+}
+
+func (c *Client) wait(ctx context.Context, duration time.Duration) error {
+	select {
+	case <-c.restart:
+		return ErrRestart
+	default:
 	}
-	clear(c.pendingTraffic)
-	if response.Accepted < len(c.results) {
-		return errors.New("panel did not accept all rule synchronization results")
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.restart:
+		return ErrRestart
+	case <-c.wake:
+		c.forceConfig = true
+		return nil
+	case <-timer.C:
+		return nil
 	}
-	c.results = nil
-	return nil
 }
 
 type savedConfig struct {

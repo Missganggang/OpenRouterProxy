@@ -1,3 +1,4 @@
+import { useAuthStore } from '../../store/auth'
 /**
  * 转发规则页面（规格书 9.2、6.4、6.7、6.8、8.9）。
  *
@@ -131,6 +132,7 @@ interface RuleFormValues {
 
 export default function ForwardRulesPage() {
   const { t } = useI18n()
+  const currentUser = useAuthStore((state) => state.user)
 
   // ── 列表状态 ─────────────────────────────────────────
   const [rules, setRules] = useState<ForwardRule[]>([])
@@ -191,7 +193,7 @@ export default function ForwardRulesPage() {
       const [g, rg, u] = await Promise.all([
         deviceGroupApi.list({ page: 1, page_size: 300 }),
         ruleApi.listGroups({ page: 1, page_size: 200 }),
-        userApi.list({ page: 1, page_size: 500 }),
+        currentUser?.role === 'admin' ? userApi.list({ page: 1, page_size: 500 }) : Promise.resolve({ items: currentUser ? [currentUser] : [] }),
       ])
       setGroups(g.items)
       setRuleGroups(rg.items)
@@ -199,7 +201,7 @@ export default function ForwardRulesPage() {
     } catch (err) {
       showApiError(err, t('rule.loadRefsFailed'))
     }
-  }, [t])
+  }, [t, currentUser])
 
   useEffect(() => {
     void loadRefs()
@@ -290,7 +292,7 @@ export default function ForwardRulesPage() {
       inbound_group_id: values.inbound_group_id,
       listen_port: values.listen_port ?? 0,
       listen_port_end: values.listen_port_end || undefined,
-      outbound_group_id: values.outbound_group_id || undefined,
+      outbound_group_id: values.chain_groups?.length ? undefined : values.outbound_group_id || undefined,
       targets: (values.targets ?? []).filter((x) => x.host && x.port),
       target_balance: values.target_balance,
       inbound_multiplier: Number(values.inbound_multiplier ?? 1),
@@ -714,7 +716,7 @@ export default function ForwardRulesPage() {
             mode="multiple"
             style={{ width: '100%' }}
             placeholder={t('rule.chainPlaceholder')}
-            options={outboundGroups.map((g) => ({ label: g.name, value: g.id }))}
+            options={outboundGroups.map((g) => ({ label: g.name, value: g.id, disabled: !!g.failover_group_id }))}
             onChange={(v: number[]) => {
               chain = v
             }}
@@ -756,7 +758,7 @@ export default function ForwardRulesPage() {
             {row.chain_groups?.length > 0 && (
               <Tooltip title={t('rule.chain')}>
                 <Tag color="geekblue" style={{ margin: 0 }}>
-                  ×{row.chain_groups.length + 1}
+                  ×{row.chain_groups.length}
                 </Tag>
               </Tooltip>
             )}
@@ -1566,6 +1568,7 @@ function RuleEditor({
                 showSearch
                 optionFilterProp="label"
                 placeholder={t('rule.singleEnd')}
+                disabled={chainActive}
                 options={outboundGroups.map((g) => ({ label: g.name, value: g.id }))}
               />
             </Form.Item>
@@ -1749,7 +1752,7 @@ function RuleEditor({
         <Form.Item
           name="chain_groups"
           label={t('rule.chainGroups')}
-          tooltip={t('rule.chainHint')}
+          tooltip="按选择顺序构成完整的 2～3 跳出口路径，不再额外追加普通出口组。链式仅支持 TCP。"
           rules={[
             {
               validator: (_, v: number[]) => {
@@ -1765,7 +1768,7 @@ function RuleEditor({
           <Select
             mode="multiple"
             placeholder={t('rule.chainPlaceholder')}
-            options={outboundGroups.map((g) => ({ label: g.name, value: g.id }))}
+            options={outboundGroups.map((g) => ({ label: g.name, value: g.id, disabled: !!g.failover_group_id }))}
           />
         </Form.Item>
 

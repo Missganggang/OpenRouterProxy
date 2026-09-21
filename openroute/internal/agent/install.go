@@ -598,6 +598,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-${ENV_PATH}
+Environment=OPENROUTE_SYSTEMD_UNIT=${SERVICE_UNIT}.service
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${BINARY_PATH} -c ${CONFIG_PATH}
 Restart=always

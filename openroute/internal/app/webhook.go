@@ -37,6 +37,7 @@ const (
 	EventAlertResolved     = "alert.resolved"
 	EventMigrationFinished = "migration.finished"
 	EventBackupFinished    = "backup.finished"
+	EventWebhookTest       = "webhook.test"
 )
 
 // Webhook 请求头名。
@@ -72,7 +73,7 @@ type WebhookPayload struct {
 //
 // 两种发送方式：
 //   - SendAsync：即发即忘，投递到内部队列后立刻返回，转发 / 心跳链路绝不阻塞；
-//   - SendSync：同步发送（含重试），供 POST /api/v1/webhooks/test 使用，
+//   - SendSync：同步发送一次，供 POST /api/v1/webhooks/test 使用，
 //     让用户能立刻知道地址填得对不对。
 type WebhookService struct {
 	app *App
@@ -116,7 +117,7 @@ func NewWebhookService(a *App) *WebhookService {
 func ValidWebhookEvent(ev string) bool {
 	switch ev {
 	case EventNodeOnline, EventNodeOffline, EventRuleSyncFailed, EventRuleSyncOK,
-		EventAlertFired, EventAlertResolved, EventMigrationFinished, EventBackupFinished:
+		EventAlertFired, EventAlertResolved, EventMigrationFinished, EventBackupFinished, EventWebhookTest:
 		return true
 	}
 	return false
@@ -213,7 +214,7 @@ func (s *WebhookService) SendAsync(url string, event string, data interface{}) {
 	}
 }
 
-// SendSync 同步发送一条 Webhook，包含重试。
+// SendSync 同步发送一次 Webhook；后台事件由 SendAsync 重试。
 //
 // 供 POST /api/v1/webhooks/test 使用：用户点击「测试」时应当立刻看到成功或失败，
 // 而不是等后台重试完才知道地址填错了。
@@ -236,7 +237,7 @@ func (s *WebhookService) SendSync(ctx context.Context, url, event string, data i
 	if err != nil {
 		return response.Wrap(response.CodeInternal, err, "序列化 Webhook 请求体失败")
 	}
-	return s.deliver(ctx, url, event, body)
+	return s.post(ctx, url, event, body)
 }
 
 // buildPayload 把事件与负载序列化为请求体，并附带时间戳。
@@ -295,8 +296,8 @@ func (s *WebhookService) deliver(ctx context.Context, url, event string, body []
 //   - X-OpenRoute-Signature：HMAC-SHA256(body, secret-key) 的十六进制串；
 //   - Content-Type：application/json。
 func (s *WebhookService) post(ctx context.Context, url, event string, body []byte) error {
-	// ctx 可能因调用方提前返回而结束；Webhook 需要能独立送达，因此去掉取消信号。
-	reqCtx := context.WithoutCancel(ctx)
+	// 同步测试遵守请求取消；异步队列使用自己的生命周期上下文。
+	reqCtx := ctx
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -346,7 +347,7 @@ func (s *WebhookService) startWorker() {
 				case <-s.app.Done():
 					return
 				case job := <-s.queue:
-					s.handle(job)
+					s.handle(ctx, job)
 				}
 			}
 		})
@@ -354,8 +355,7 @@ func (s *WebhookService) startWorker() {
 }
 
 // handle 处理一条异步任务：序列化 + 带重试投递，失败只记日志。
-func (s *WebhookService) handle(job webhookJob) {
-	ctx := context.Background()
+func (s *WebhookService) handle(ctx context.Context, job webhookJob) {
 	body, err := s.buildPayload(job.event, job.data)
 	if err != nil {
 		s.app.Log.Warn("序列化 Webhook 请求体失败",

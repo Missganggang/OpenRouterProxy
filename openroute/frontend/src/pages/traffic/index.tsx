@@ -17,6 +17,7 @@ import {
   Empty,
   Row,
   Segmented,
+  Select,
   Space,
   Statistic,
   Switch,
@@ -30,7 +31,7 @@ import type { ColumnsType } from 'antd/es/table'
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
 
-import { showApiError, trafficApi } from '../../api'
+import { nodeApi, ruleApi, userApi, showApiError, trafficApi } from '../../api'
 import type {
   TrafficOverview,
   TrafficPeriod,
@@ -49,6 +50,7 @@ function periodValue(p: TrafficPeriod | undefined, raw: boolean): number {
   return raw ? p.raw : p.total
 }
 import { useI18n } from '../../locales'
+import { useAuthStore } from '../../store/auth'
 
 const { Text } = Typography
 
@@ -63,13 +65,32 @@ type RangeKey = '24h' | '7d' | '30d' | 'custom'
 
 export default function TrafficPage() {
   const { t } = useI18n()
+  const currentUser = useAuthStore((state) => state.user)
+  const isAdmin = currentUser?.role === 'admin'
 
   const [dimension, setDimension] = useState<Dimension>('user')
   const [interval, setInterval] = useState<Interval>('hour')
   const [rangeKey, setRangeKey] = useState<RangeKey>('24h')
   const [customRange, setCustomRange] = useState<[Dayjs, Dayjs] | null>(null)
+  const [rangeNow, setRangeNow] = useState(() => Date.now())
   /** 统计口径开关：true 显示乘倍率后的值（默认），false 显示原始字节。 */
   const [showRaw, setShowRaw] = useState(false)
+  const [userID, setUserID] = useState<number>()
+  const [ruleID, setRuleID] = useState<number>()
+  const [nodeID, setNodeID] = useState<number>()
+  const [direction, setDirection] = useState<'in' | 'out'>()
+  const [choices, setChoices] = useState<{ users: { label: string; value: number }[]; rules: { label: string; value: number }[]; nodes: { label: string; value: number }[] }>({ users: [], rules: [], nodes: [] })
+  useEffect(() => {
+    void Promise.allSettled([
+      isAdmin ? userApi.list({ page_size: 200 }) : Promise.resolve({ items: currentUser ? [currentUser] : [] }),
+      ruleApi.list({ page_size: 200 }),
+      isAdmin ? nodeApi.list({ page_size: 200 }) : Promise.resolve({ items: [] }),
+    ]).then(([users, rules, nodes]) => setChoices({
+      users: users.status === 'fulfilled' ? users.value.items.map((u) => ({label: u.username, value: u.id})) : [],
+      rules: rules.status === 'fulfilled' ? rules.value.items.map((r) => ({label: r.name, value: r.id})) : [],
+      nodes: nodes.status === 'fulfilled' ? nodes.value.items.map((n) => ({label: n.name, value: n.id})) : [],
+    }))
+  }, [currentUser, isAdmin])
 
   const [points, setPoints] = useState<TrafficPoint[]>([])
   const [top, setTop] = useState<TrafficTopItem[]>([])
@@ -79,20 +100,20 @@ export default function TrafficPage() {
 
   /** 把快捷范围换算成 from/to。 */
   const range = useMemo<{ from: string; to: string }>(() => {
-    const now = dayjs()
+    const now = dayjs(rangeNow)
     if (rangeKey === 'custom' && customRange) {
       return {
-        from: customRange[0].startOf('day').format('YYYY-MM-DD HH:mm:ss'),
-        to: customRange[1].endOf('day').format('YYYY-MM-DD HH:mm:ss'),
+        from: customRange[0].startOf('day').toISOString(),
+        to: customRange[1].endOf('day').toISOString(),
       }
     }
     const days = rangeKey === '7d' ? 7 : rangeKey === '30d' ? 30 : 1
     // 24 小时档按小时展示，更长范围自动切到天，避免曲线点过于稀疏或密集。
     return {
-      from: now.subtract(days, 'day').format('YYYY-MM-DD HH:mm:ss'),
-      to: now.format('YYYY-MM-DD HH:mm:ss'),
+      from: now.subtract(days, 'day').toISOString(),
+      to: now.toISOString(),
     }
-  }, [rangeKey, customRange])
+  }, [rangeKey, customRange, rangeNow])
 
   // 快捷范围与粒度联动：超过 3 天时默认按天，用户仍可手动改回。
   useEffect(() => {
@@ -109,10 +130,12 @@ export default function TrafficPage() {
           to: range.to,
           interval,
           group_by: dimension,
+          user_id: userID, rule_id: ruleID, node_id: nodeID, direction,
         }),
         trafficApi.top({
           dimension: dimension === 'direction' ? 'user' : dimension,
           limit: 20,
+          user_id: userID, rule_id: ruleID, node_id: nodeID, direction, interval, raw: showRaw,
           from: range.from,
           to: range.to,
         }),
@@ -126,7 +149,7 @@ export default function TrafficPage() {
     } finally {
       setLoading(false)
     }
-  }, [range.from, range.to, interval, dimension, t])
+  }, [range.from, range.to, interval, dimension, userID, ruleID, nodeID, direction, showRaw, t])
 
   useEffect(() => {
     void load()
@@ -187,6 +210,7 @@ export default function TrafficPage() {
         to: range.to,
         interval,
         group_by: dimension,
+        user_id: userID, rule_id: ruleID, node_id: nodeID, direction,
       })
       message.success(t('traffic.exportQueued'))
     } catch (err) {
@@ -258,15 +282,15 @@ export default function TrafficPage() {
     },
     {
       title: t('traffic.rawBytes'),
-      dataIndex: 'raw_bytes',
-      key: 'raw_bytes',
+      dataIndex: 'raw',
+      key: 'raw',
       width: 140,
       render: (v: number) => <Text className="or-mono">{formatBytes(v ?? 0)}</Text>,
     },
     {
-      title: t('traffic.billedBytes'),
-      dataIndex: 'bytes',
-      key: 'bytes',
+      title: showRaw ? t('traffic.caliberRaw') : t('traffic.billedBytes'),
+      dataIndex: 'total',
+      key: 'total',
       width: 140,
       render: (v: number) => <Text className="or-mono">{formatBytes(v ?? 0)}</Text>,
     },
@@ -280,7 +304,7 @@ export default function TrafficPage() {
           <p className="or-page-desc">{t('traffic.pageDesc')}</p>
         </div>
         <Space>
-          <Button icon={<ReloadOutlined />} onClick={() => void load()}>
+          <Button icon={<ReloadOutlined />} onClick={() => setRangeNow(Date.now())}>
             {t('common.refresh')}
           </Button>
           <Button icon={<DownloadOutlined />} onClick={exportCSV}>
@@ -411,6 +435,13 @@ export default function TrafficPage() {
             {showRaw ? t('traffic.caliberRaw') : t('traffic.caliberBilled')}
           </Tag>
         </Space>
+        <Space wrap style={{ marginTop: 12 }}>
+          {isAdmin && <Select allowClear showSearch optionFilterProp="label" placeholder="全部用户" value={userID} onChange={setUserID} options={choices.users} style={{ minWidth: 150 }} />}
+          <Select allowClear showSearch optionFilterProp="label" placeholder="全部规则" value={ruleID} onChange={setRuleID} options={choices.rules} style={{ minWidth: 180 }} />
+          {isAdmin && <Select allowClear showSearch optionFilterProp="label" placeholder="全部节点" value={nodeID} onChange={setNodeID} options={choices.nodes} style={{ minWidth: 150 }} />}
+          <Select allowClear placeholder="全部方向" value={direction} onChange={setDirection} options={[{label: '入向',value: 'in'}, {label: '出向',value: 'out'}]} style={{ minWidth: 130 }} />
+          <Text type="secondary">曲线与排行按筛选条件统计，统计桶使用 UTC。</Text>
+        </Space>
       </Card>
 
       <Alert
@@ -486,7 +517,7 @@ export default function TrafficPage() {
               size="small"
               pagination={false}
               dataSource={top}
-              columns={topColumns}
+              columns={topColumns.filter((column) => !showRaw || column.key !== 'raw')}
               scroll={{ x: 420 }}
               locale={{
                 emptyText: <Empty className="or-empty" description={t('traffic.emptyTop')} />,

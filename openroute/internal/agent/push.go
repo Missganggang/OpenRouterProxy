@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -57,20 +58,54 @@ func (b *ConfigBuilder) build(ctx context.Context, n *model.Node, removed []uint
 	if n == nil || n.ID == 0 {
 		return nil, response.Field(response.CodeParamInvalid, "node_id", 0, "节点 ID 不能为空")
 	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Take the version before any configuration reads. Tagging a response
+		// with a version read at the end can permanently hide a concurrent edit.
+		version := b.app.ConfigVersion()
+		var current model.Node
+		if err := b.app.DB.WithContext(ctx).First(&current, n.ID).Error; err != nil {
+			return nil, err
+		}
+		resp, hashes, err := b.buildVersion(ctx, &current, removed, version)
+		if version != b.app.ConfigVersion() {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err = b.saveTrafficPolicies(ctx, resp, hashes); err != nil {
+			if version != b.app.ConfigVersion() {
+				continue
+			}
+			return nil, err
+		}
+		if version == b.app.ConfigVersion() {
+			return resp, nil
+		}
+	}
+	return nil, response.New(response.CodeStateConflict, "配置正在更新，请重试获取节点配置")
+}
 
+func (b *ConfigBuilder) buildVersion(ctx context.Context, n *model.Node, removed []uint64, version int64) (*ConfigResponse, map[uint64]string, error) {
 	groups, err := b.loadGroups(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	rules, err := b.rulesForNode(ctx, n, groups)
+	rules, hashes, err := b.rulesForNodeWithHashes(ctx, n, groups)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if err := b.applyUserPolicies(ctx, rules); err != nil {
+		return nil, nil, err
 	}
 
 	dgConfig, err := b.deviceGroupConfigs(ctx, n, groups)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// 全量下发的判定依据是「调用方是否传了要删除的规则」：
@@ -79,15 +114,23 @@ func (b *ConfigBuilder) build(ctx context.Context, n *model.Node, removed []uint
 	if removed == nil {
 		removed = []uint64{}
 	}
+	listeners := nodePorts(n)
+	listeners.TLSCertPEM, listeners.TLSKeyPEM, _, err = b.nodeCertificate(n.ID)
+	if err != nil {
+		return nil, nil, err
+	}
 	return &ConfigResponse{
-		ConfigVersion:     b.app.ConfigVersion(),
+		NodeID:            n.ID,
+		NodeDisabled:      n.Disabled,
+		Listeners:         listeners,
+		ConfigVersion:     version,
 		Full:              full,
 		Rules:             rules,
 		RemovedRuleIDs:    removed,
 		DeviceGroupConfig: dgConfig,
 		HeartbeatInterval: b.HeartbeatInterval(),
 		GeneratedAt:       time.Now().UTC().Unix(),
-	}, nil
+	}, hashes, nil
 }
 
 // HeartbeatInterval 返回面板规定的心跳间隔（秒），配置缺失时回退默认值。
@@ -150,24 +193,30 @@ func (b *ConfigBuilder) loadGroups(ctx context.Context) (map[uint64]*model.Devic
 //   - 节点既不是入口成员也不是出口成员时，该规则与它无关；
 //   - 关闭（enable = false）的规则照常下发但带 enable = false，节点据此停监听。
 func (b *ConfigBuilder) rulesForNode(ctx context.Context, n *model.Node, groups map[uint64]*model.DeviceGroup) ([]ConfigRule, error) {
+	rules, _, err := b.rulesForNodeWithHashes(ctx, n, groups)
+	return rules, err
+}
+
+func (b *ConfigBuilder) rulesForNodeWithHashes(ctx context.Context, n *model.Node, groups map[uint64]*model.DeviceGroup) ([]ConfigRule, map[uint64]string, error) {
 	var rules []model.ForwardRule
 	if err := b.app.DB.WithContext(ctx).Order("id ASC").Find(&rules).Error; err != nil {
-		return nil, response.Wrap(response.CodeInternal, err, "查询转发规则失败")
+		return nil, nil, response.Wrap(response.CodeInternal, err, "查询转发规则失败")
 	}
 
 	out := make([]ConfigRule, 0, len(rules))
+	hashes := make(map[uint64]string)
 	for i := range rules {
 		r := &rules[i]
 
 		inGroup := groups[r.InboundGroupID]
 		outGroup := groups[r.OutboundGroupID]
 
-		isInboundNode := inGroup != nil && containsID(inGroup.NodeIDs.AsUint64Slice(), n.ID)
-		isOutboundNode := outGroup != nil && containsID(outGroup.NodeIDs.AsUint64Slice(), n.ID)
+		isInboundNode, isOutboundNode := model.RuleNodeRoles(r, n.ID, groups)
 
 		if !isInboundNode && !isOutboundNode {
 			continue
 		}
+		hashes[r.ID] = model.RuleConfigHash(*r)
 
 		// 入口视角与出口视角分别下发。单端（无出口组）时只有入口视角。
 		if isInboundNode {
@@ -177,7 +226,7 @@ func (b *ConfigBuilder) rulesForNode(ctx context.Context, n *model.Node, groups 
 			out = append(out, b.compileRule(r, n, inGroup, outGroup, true))
 		}
 	}
-	return out, nil
+	return out, hashes, nil
 }
 
 // compileRule 把一条规则编译成节点可用的下发结构。
@@ -188,6 +237,8 @@ func (b *ConfigBuilder) compileRule(r *model.ForwardRule, n *model.Node,
 	inGroup, outGroup *model.DeviceGroup, isOutbound bool) ConfigRule {
 
 	cr := ConfigRule{
+		TunnelToken:        hex.EncodeToString(b.deriveSecret("rule-tunnel", r.ID)),
+		UserID:             r.UserID,
 		RuleID:             r.ID,
 		Name:               r.Name,
 		IsOutbound:         isOutbound,
@@ -212,7 +263,7 @@ func (b *ConfigBuilder) compileRule(r *model.ForwardRule, n *model.Node,
 		ParentID:           r.ParentID,
 		SNI:                r.SNI,
 		Shaping:            r.ShapingList(),
-		Enable:             r.Enable,
+		Enable:             r.Enable && !n.Disabled,
 	}
 	if cr.Targets == nil {
 		cr.Targets = []ConfigTarget{}
@@ -277,10 +328,25 @@ func (b *ConfigBuilder) deviceGroupConfigs(ctx context.Context, n *model.Node,
 		}
 	}
 	// 2. 补上被引用的组（故障转移组）。
-	for id := range relevant {
-		g := groups[id]
-		if g != nil && g.FailoverGroupID > 0 {
-			relevant[g.FailoverGroupID] = true
+	var rules []model.ForwardRule
+	if err := b.app.DB.WithContext(ctx).Find(&rules).Error; err != nil {
+		return nil, err
+	}
+	for i := range rules {
+		in, out := model.RuleNodeRoles(&rules[i], n.ID, groups)
+		if in || out {
+			for id := range model.RuleGroupIDs(&rules[i], groups) {
+				relevant[id] = true
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for id := range relevant {
+			if g := groups[id]; g != nil && g.FailoverGroupID != 0 && !relevant[g.FailoverGroupID] {
+				relevant[g.FailoverGroupID] = true
+				changed = true
+			}
 		}
 	}
 
@@ -304,6 +370,10 @@ func (b *ConfigBuilder) deviceGroupConfigs(ctx context.Context, n *model.Node,
 		if g == nil {
 			continue
 		}
+		resolved, err := b.resolvePeers(g, peers)
+		if err != nil {
+			return nil, err
+		}
 		out[strconv.FormatUint(id, 10)] = DeviceGroupConfig{
 			GroupID:              g.ID,
 			Name:                 g.Name,
@@ -317,7 +387,7 @@ func (b *ConfigBuilder) deviceGroupConfigs(ctx context.Context, n *model.Node,
 			HealthCheckSuccCount: g.HealthCheckSuccCount,
 			FailoverGroupID:      g.FailoverGroupID,
 			Config:               rawOptions(g.Config),
-			Peers:                b.resolvePeers(g, peers),
+			Peers:                resolved,
 		}
 	}
 	return out, nil
@@ -349,7 +419,7 @@ func (b *ConfigBuilder) loadPeers(ctx context.Context, ids map[uint64]bool) (map
 //
 // 成员顺序即设备组的 NodeIDs 顺序：出口组的顺序参与负载均衡初始化
 // （规格书 4.2.5），因此这里 MUST 保持原序，不能排序。
-func (b *ConfigBuilder) resolvePeers(g *model.DeviceGroup, peers map[uint64]*model.Node) []GroupPeer {
+func (b *ConfigBuilder) resolvePeers(g *model.DeviceGroup, peers map[uint64]*model.Node) ([]GroupPeer, error) {
 	ids := g.NodeIDs.AsUint64Slice()
 	out := make([]GroupPeer, 0, len(ids))
 	for _, id := range ids {
@@ -358,26 +428,35 @@ func (b *ConfigBuilder) resolvePeers(g *model.DeviceGroup, peers map[uint64]*mod
 			continue
 		}
 		host, connectPort := resolveConnectAddress(g, n)
-		wsPort := n.WsPort
+		ports := nodePorts(n)
+		wsPort := ports.WsPort
 		// 静态连接地址显式给了端口时，用它覆盖节点上报的 ws 端口，
 		// 这是「域名 + 非默认端口」部署模式下唯一可靠的连接端口来源。
-		if connectPort > 0 {
+		if connectPort > 0 && strings.EqualFold(fmt.Sprint(rawOptions(g.Config)["connect_type"]), "static") {
 			wsPort = connectPort
+			ports.DirectPort, ports.TlsPort, ports.UdpPort = connectPort, connectPort, connectPort
+		}
+		_, _, tlsPin, err := b.nodeCertificate(n.ID)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, GroupPeer{
-			NodeID:     n.ID,
-			Name:       n.Name,
-			Host:       host,
-			DirectPort: n.DirectPort,
-			WsPort:     wsPort,
-			TlsPort:    n.TlsPort,
-			UdpPort:    n.UdpPort,
-			RevPort:    n.RevPort,
-			Weight:     normalizeWeight(n.Weight),
-			Online:     n.Online,
+			TLSPin:      tlsPin,
+			CurrentConn: n.CurrentConn,
+			MaxConn:     n.MaxConn,
+			NodeID:      n.ID,
+			Name:        n.Name,
+			Host:        host,
+			DirectPort:  ports.DirectPort,
+			WsPort:      wsPort,
+			TlsPort:     ports.TlsPort,
+			UdpPort:     ports.UdpPort,
+			RevPort:     ports.RevPort,
+			Weight:      normalizeWeight(n.Weight),
+			Online:      n.Online && !n.Disabled,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // resolveConnectAddress 按规格书 4.3 的连接地址优先级解析出对端地址。
@@ -394,42 +473,39 @@ func (b *ConfigBuilder) resolvePeers(g *model.DeviceGroup, peers map[uint64]*mod
 // 无回退机制：选中 IPv6 且不可达时不会自动退回 IPv4（规格书 4.3 的注意事项），
 // 因此这里只在确实配置了 ipv6_group 或节点没有 IPv4 时才选择 IPv6。
 func resolveConnectAddress(g *model.DeviceGroup, n *model.Node) (string, int) {
-	if g != nil && strings.EqualFold(g.Type, model.GroupTypeOutbound) {
-		var cfg struct {
-			ConnectType    string `json:"connect_type"`
-			ConnectAddress string `json:"connect_address"`
-			ConnectPort    int    `json:"connect_port"`
-			Protocol       string `json:"protocol"`
-		}
-		if len(g.Config) > 0 {
-			_ = jsonUnmarshal(string(g.Config), &cfg)
-		}
-		if strings.EqualFold(cfg.ConnectType, "static") && strings.TrimSpace(cfg.ConnectAddress) != "" {
-			port := cfg.ConnectPort
-			if port <= 0 {
-				port = portForProtocol(n, cfg.Protocol)
-			}
-			return strings.TrimSpace(cfg.ConnectAddress), port
-		}
+	cfg := struct {
+		ConnectType    string   `json:"connect_type"`
+		ConnectAddress string   `json:"connect_address"`
+		ConnectPort    int      `json:"connect_port"`
+		Protocol       string   `json:"protocol"`
+		IPv6Group      []uint64 `json:"ipv6_group"`
+	}{}
+	if g != nil {
+		_ = jsonUnmarshal(string(g.Config), &cfg)
 	}
-
-	// 静态连接地址（节点行上的覆盖值）。
-	if strings.TrimSpace(n.ConnectHost) != "" {
-		return strings.TrimSpace(n.ConnectHost), n.WsPort
+	ports := nodePorts(n)
+	port := ports.WsPort
+	switch cfg.Protocol {
+	case "direct":
+		port = ports.DirectPort
+	case "tls":
+		port = ports.TlsPort
 	}
-
-	// 双机专线：节点配置了内网 IP 时优先走内网（规格书 1.4「指定内网 IP 实现双机专线」）。
-	if strings.TrimSpace(n.PrivateIP) != "" && n.IsStatic {
-		return strings.TrimSpace(n.PrivateIP), n.WsPort
+	if cfg.ConnectPort <= 0 {
+		cfg.ConnectPort = port
 	}
-
-	if strings.TrimSpace(n.PublicIPv4) != "" {
-		return strings.TrimSpace(n.PublicIPv4), n.WsPort
+	host := n.ConnectHost
+	if host == "" && n.IsStatic {
+		host = n.PrivateIP
 	}
-	if strings.TrimSpace(n.PublicIPv6) != "" {
-		return strings.TrimSpace(n.PublicIPv6), n.TlsPort
+	address, selectedPort, _ := app.ResolveConnectAddress(app.ConnectAddressInput{
+		ConnectType: cfg.ConnectType, ConnectAddress: cfg.ConnectAddress, ConnectPort: cfg.ConnectPort,
+		PublicIPv4: n.PublicIPv4, PublicIPv6: n.PublicIPv6, ConnectHost: host, NodePort: port, IPv6Group: cfg.IPv6Group, NodeID: n.ID,
+	})
+	if address == "" && cfg.ConnectType != "dyn_ip4" {
+		address = n.PublicIPv6
 	}
-	return "", 0
+	return address, selectedPort
 }
 
 // portForProtocol 按协议返回节点对应的监听端口。
@@ -454,7 +530,7 @@ func portForProtocol(n *model.Node, protocol string) int {
 // 单端（无出口组）时固定为 direct（入口直出，规格书 6.5）；
 // 否则取入口组配置里的 protocol 字段，缺省为 tls。
 func ruleProtocol(r *model.ForwardRule, inGroup *model.DeviceGroup) string {
-	if r.OutboundGroupID == 0 {
+	if r.OutboundGroupID == 0 && len(r.ChainGroupList()) == 0 && !r.ReverseEnable {
 		return "direct"
 	}
 	if inGroup == nil {
@@ -579,32 +655,38 @@ func (r *Registry) ReportHandler(c *gin.Context) {
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
 
-	accepted := 0
-	for _, res := range req.Results {
-		if res.RuleID == 0 {
-			continue
-		}
-		status := model.SyncNormal
-		if strings.EqualFold(res.Status, model.SyncFailed) {
-			status = model.SyncFailed
-		} else if model.ValidSyncStatus(res.Status) {
-			status = res.Status
-		}
-		updates := map[string]interface{}{
-			"sync_status": status,
-			"sync_error":  util.Truncate(res.Error, 512),
-			"synced_at":   now,
-			"updated_at":  now,
-		}
-		// 用规则 + 节点双条件收窄；规则不属于该节点时不影响其它数据。
-		if err := r.app.DB.WithContext(ctx).Model(&model.ForwardRule{}).
-			Where("id = ?", res.RuleID).Updates(updates).Error; err != nil {
-			r.app.Log.Warn("更新规则同步状态失败",
-				zap.Uint64("rule_id", res.RuleID), zap.Error(err))
-			continue
-		}
-		accepted++
+	if req.NodeID != 0 && req.NodeID != node.ID {
+		fail(c, response.New(response.CodeForbidden, "节点身份不匹配"))
+		return
 	}
+	if err := r.app.Traffic.RecordNodeReport(ctx, node.ID, req); err != nil {
+		fail(c, response.Wrap(response.CodeDBUnwritable, err, "流量报告未提交"))
+		return
+	}
+	combined := map[uint64]RuleSyncResult{}
+	for _, result := range req.Results {
+		if result.RuleID == 0 {
+			continue
+		}
+		if result.Status != "normal" && result.Status != "failed" {
+			fail(c, response.New(response.CodeParamInvalid, "无效的规则同步状态"))
+			return
+		}
+		previous, exists := combined[result.RuleID]
+		if !exists || previous.Status != "failed" {
+			combined[result.RuleID] = result
+		}
+	}
+	acceptedSuccess := false
+	for id, result := range combined {
+		committed, err := r.app.Sync.RecordNodeResultAccepted(ctx, id, node.ID, req.ConfigVersion, result.Status == "normal", result.Error)
+		if err != nil {
+			fail(c, response.Wrap(response.CodeInternal, err, "保存节点同步结果失败"))
+			return
+		}
+		acceptedSuccess = acceptedSuccess || (committed && result.Status == model.SyncNormal)
+	}
+	accepted := len(req.Results)
 
 	// 节点级统计与错误摘要。
 	nodeUpdates := map[string]interface{}{
@@ -614,18 +696,28 @@ func (r *Registry) ReportHandler(c *gin.Context) {
 	}
 	if req.Stats != nil {
 		nodeUpdates["current_conn"] = req.Stats.CurrentConn
-		if req.Stats.NetIn > 0 {
-			nodeUpdates["net_in_speed"] = req.Stats.NetIn
-		}
-		if req.Stats.NetOut > 0 {
-			nodeUpdates["net_out_speed"] = req.Stats.NetOut
-		}
+
 	}
 	if req.Error != "" {
 		nodeUpdates["last_error"] = util.Truncate(req.Error, 512)
-	} else if req.ConfigVersion > 0 {
-		// 一次成功的上报意味着节点侧没有阻塞性错误。
-		nodeUpdates["last_error"] = ""
+	} else if req.ConfigVersion == r.app.ConfigVersion() && acceptedSuccess {
+		// Historical traffic batches and ignored ACKs say nothing about whether
+		// the node has recovered. Clear errors only after an accepted success for
+		// the current configuration, with no current rule failure remaining.
+		var states []model.NodeRuleSync
+		if err := r.app.DB.WithContext(ctx).Select("rule_id, status").Where("node_id = ? AND config_version = ?", node.ID, req.ConfigVersion).Find(&states).Error; err != nil {
+			fail(c, response.Wrap(response.CodeInternal, err, "查询节点同步结果失败"))
+			return
+		}
+		currentFailure := false
+		for _, state := range states {
+			if state.Status == model.SyncFailed {
+				currentFailure = true
+			}
+		}
+		if !currentFailure {
+			nodeUpdates["last_error"] = ""
+		}
 	}
 	if err := r.app.DB.WithContext(ctx).Model(&model.Node{}).Where("id = ?", node.ID).
 		Updates(nodeUpdates).Error; err != nil {
@@ -633,7 +725,7 @@ func (r *Registry) ReportHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, ReportResponse{Accepted: accepted, ServerTime: now.Unix()})
+	c.JSON(http.StatusOK, ReportResponse{BatchID: req.BatchID, Accepted: accepted, ServerTime: now.Unix()})
 }
 
 // ---------------------------------------------------------------------------

@@ -402,7 +402,7 @@ func (h *Handlers) RuleTraffic(c *gin.Context) {
 		response.Fail(c, err)
 		return
 	}
-	series, err := h.app.Traffic.Timeseries(ctx, from, to, interval, app.GroupByDirection, mode)
+	series, err := h.app.Traffic.TimeseriesFiltered(ctx, from, to, interval, app.GroupByDirection, mode, app.TrafficFilter{RuleID: id})
 	if err != nil {
 		response.Fail(c, err)
 		return

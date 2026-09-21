@@ -43,10 +43,9 @@ func AllScopes() []string {
 // RequireScope 返回校验 API Token Scope 的中间件。
 //
 // 行为：
-//   - Session / JWT 认证（浏览器与 SPA）不受 Scope 限制，直接放行；
+//   - Session / JWT 认证按角色限制管理操作，普通用户可访问拥有的数据；
 //   - API Token 认证必须持有指定 Scope，否则返回 40302；
-//   - 管理员角色同样不受 Scope 限制（便于用 Token 做全量运维脚本时
-//     仍可通过角色授权，但默认创建 Token 时建议只授予必要 Scope）。
+//   - 管理员的 API Token 同样需要 Scope，避免窄权限令牌被扩大授权。
 //
 // 参数 scopes 为「满足任意一个即可」的范围列表。
 // 返回 gin.HandlerFunc。
@@ -54,7 +53,17 @@ func RequireScope(scopes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok := CurrentAPIToken(c)
 		if tok == nil {
-			// 非 API Token 认证：角色中间件已经做过校验，这里放行。
+			// Browsers must pass the management role boundary too. Scope checks
+			// cannot assume each route already installed a separate role guard.
+			if !IsAdmin(c) {
+				for _, scope := range scopes {
+					switch scope {
+					case ScopeNodeRead, ScopeNodeWrite, ScopeNodeExec, ScopeGroupWrite, ScopeSystemRead, ScopeSystemWrite, ScopeMigrateRun, ScopeBackupRun:
+						response.Abort(c, response.New(response.CodeForbidden, "此操作需要管理员权限"))
+						return
+					}
+				}
+			}
 			c.Next()
 			return
 		}

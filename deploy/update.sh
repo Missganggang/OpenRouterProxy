@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Update an existing deployment without replacing its config, database or WebUI.
+# Update an existing deployment, preserving its configuration and database.
 set -euo pipefail
 umask 077
 APP_DIR=/opt/openroute
@@ -19,6 +19,12 @@ cp -p "$APP_DIR/config.yml" "$BACKUP_DIR/config.yml"
 if [ -d "$APP_DIR/node-binaries" ]; then
   cp -a "$APP_DIR/node-binaries" "$BACKUP_DIR/node-binaries"
 fi
+if [ -d "$APP_DIR/public" ]; then
+  cp -a "$APP_DIR/public" "$BACKUP_DIR/public"
+fi
+if [ -d "$SRC_DIR/public" ]; then
+  [ -s "$SRC_DIR/public/index.html" ] || { echo 'Missing frontend index.html' >&2; exit 1; }
+fi
 python3 - "$APP_DIR/data.db" "$BACKUP_DIR/data.db" <<'PY'
 import sqlite3, sys
 with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as source:
@@ -35,6 +41,10 @@ rollback() {
   if [ -d "$BACKUP_DIR/node-binaries" ]; then
     cp -a "$BACKUP_DIR/node-binaries/." "$APP_DIR/node-binaries/"
   fi
+  if [ -d "$BACKUP_DIR/public" ]; then
+    mkdir -p "$APP_DIR/public"
+    cp -a "$BACKUP_DIR/public/." "$APP_DIR/public/"
+  fi
   systemctl start openroute
   exit 1
 }
@@ -45,9 +55,17 @@ for arch in amd64 amd64v3 arm64; do
   mkdir -p "$APP_DIR/node-binaries/$arch"
   install -m 0755 "$SRC_DIR/node-binaries/$arch/rel_nodeclient" "$APP_DIR/node-binaries/$arch/rel_nodeclient.new"
   mv -f "$APP_DIR/node-binaries/$arch/rel_nodeclient.new" "$APP_DIR/node-binaries/$arch/rel_nodeclient"
+  if [ -s "$SRC_DIR/node-binaries/$arch/version.txt" ]; then
+    install -m 0644 "$SRC_DIR/node-binaries/$arch/version.txt" "$APP_DIR/node-binaries/$arch/version.txt"
+  fi
 done
 install -m 0755 "$SRC_DIR/openroute" "$APP_DIR/openroute.new"
 systemctl stop openroute
+if [ -d "$SRC_DIR/public" ]; then
+  mkdir -p "$APP_DIR/public"
+  # Retain old hashed assets for browser tabs opened before the update.
+  cp -a "$SRC_DIR/public/." "$APP_DIR/public/"
+fi
 mv -f "$APP_DIR/openroute.new" "$APP_DIR/openroute"
 systemctl start openroute
 healthy=0

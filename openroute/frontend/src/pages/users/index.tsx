@@ -1,3 +1,4 @@
+import UserGroups from './Groups'
 /**
  * 用户管理页面（规格书 9.2、8.11）。
  *
@@ -499,6 +500,7 @@ export default function UsersPage() {
           <p className="or-page-desc">{t('user.pageDesc')}</p>
         </div>
         <Space>
+          <UserGroups groups={groups} onChanged={loadGroups} />
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>
             {t('common.refresh')}
           </Button>

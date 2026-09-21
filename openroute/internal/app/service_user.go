@@ -285,6 +285,7 @@ func (s *UserService) Update(ctx context.Context, id uint64, in UserInput) (*mod
 		s.subLimit.SetRate(userLimiterKey(id), user.SpeedLimit)
 	}
 
+	s.app.BumpConfigVersion("更新用户策略")
 	s.app.Audit.Write(ctx, AuditEntry{
 		Action:     model.ActionUpdate,
 		Resource:   "user",
@@ -337,6 +338,7 @@ func (s *UserService) Delete(ctx context.Context, id uint64, force bool) error {
 		return response.Wrap(response.CodeInternal, err, "删除用户失败")
 	}
 
+	s.app.BumpConfigVersion("删除用户及规则")
 	s.app.Audit.Write(ctx, AuditEntry{
 		Action:     model.ActionDelete,
 		Resource:   "user",
@@ -376,6 +378,7 @@ func (s *UserService) SetStatus(ctx context.Context, id uint64, enabled bool) er
 	if enabled {
 		msg = "启用用户 "
 	}
+	s.app.BumpConfigVersion("更新用户启用状态")
 	s.app.Audit.Write(ctx, AuditEntry{
 		Action:     model.ActionUpdate,
 		Resource:   "user",
@@ -617,6 +620,7 @@ func (s *UserService) UpdateGroup(ctx context.Context, id uint64, in UserGroupPa
 		return nil, response.Wrap(response.CodeInternal, err, "更新用户分组失败")
 	}
 
+	s.app.BumpConfigVersion("更新用户组策略")
 	s.app.Audit.Write(ctx, AuditEntry{
 		Action:     model.ActionUpdate,
 		Resource:   "user_group",

@@ -46,7 +46,7 @@ export function create(input: NodeCreateInput) {
 }
 
 /** 更新节点。 */
-export function update(id: number, input: Partial<NodeCreateInput>) {
+export function update(id: number, input: Partial<NodeCreateInput> & { disabled?: boolean }) {
   return put<Node>(`/nodes/${id}`, input)
 }
 

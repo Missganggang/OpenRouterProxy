@@ -436,51 +436,47 @@ func (h *Handlers) NodeRules(c *gin.Context) {
 		return
 	}
 
-	// 1. 该节点所属的入口设备组。
 	var groups []model.DeviceGroup
-	if err := h.app.DB.WithContext(ctx).
-		Where("type = ?", model.GroupTypeInbound).
-		Find(&groups).Error; err != nil {
-		response.Fail(c, response.Wrap(response.CodeInternal, err, "查询入口设备组失败"))
+	if err := h.app.DB.WithContext(ctx).Find(&groups).Error; err != nil {
+		response.Fail(c, response.Wrap(response.CodeInternal, err, "查询设备组失败"))
 		return
 	}
-	groupsOfNode := make(map[uint64]*model.DeviceGroup)
-	groupIDs := make([]uint64, 0, len(groups))
+	byID := map[uint64]*model.DeviceGroup{}
+	groupIDs := []uint64{}
 	for i := range groups {
-		if nodeGroupHitLocal(groups[i].NodeIDs.AsUint64Slice(), id) {
-			groupsOfNode[groups[i].ID] = &groups[i]
+		byID[groups[i].ID] = &groups[i]
+		if groups[i].IsInbound() && nodeGroupHitLocal(groups[i].NodeIDs.AsUint64Slice(), id) {
 			groupIDs = append(groupIDs, groups[i].ID)
 		}
 	}
-
+	var rules []model.ForwardRule
+	if err := h.app.DB.WithContext(ctx).Where("enable = ?", true).Order("listen_port ASC, id ASC").Find(&rules).Error; err != nil {
+		response.Fail(c, response.Wrap(response.CodeInternal, err, "查询节点规则失败"))
+		return
+	}
+	var syncRows []model.NodeRuleSync
+	if err := h.app.DB.WithContext(ctx).Where("node_id = ?", id).Find(&syncRows).Error; err != nil {
+		response.Fail(c, response.Wrap(response.CodeInternal, err, "查询同步结果失败"))
+		return
+	}
+	states := map[uint64]model.NodeRuleSync{}
+	for _, state := range syncRows {
+		states[state.RuleID] = state
+	}
 	items := make([]NodeRunningRule, 0)
-	if len(groupIDs) > 0 {
-		var rules []model.ForwardRule
-		if err := h.app.DB.WithContext(ctx).
-			Where("inbound_group_id IN ? AND enable = ?", groupIDs, true).
-			Order("listen_port ASC, id ASC").Find(&rules).Error; err != nil {
-			response.Fail(c, response.Wrap(response.CodeInternal, err, "查询节点规则失败"))
-			return
+	for i := range rules {
+		r := &rules[i]
+		in, out := model.RuleNodeRoles(r, id, byID)
+		if !in && !out {
+			continue
 		}
-		for i := range rules {
-			r := &rules[i]
-			g := groupsOfNode[r.InboundGroupID]
-			items = append(items, NodeRunningRule{
-				ID:            r.ID,
-				Name:          r.Name,
-				UserID:        r.UserID,
-				RuleGroupID:   r.RuleGroupID,
-				InboundGroup:  r.InboundGroupID,
-				ListenPort:    r.ListenPort,
-				ListenPortEnd: r.ListenPortEnd,
-				OutboundGroup: r.OutboundGroupID,
-				Protocol:      nodeRuleProtocol(r, g),
-				Targets:       len(r.TargetList()),
-				SyncStatus:    r.SyncStatus,
-				SyncError:     r.SyncError,
-				Enable:        r.Enable,
-			})
+		status, syncError := model.SyncUnsynced, "等待此节点确认配置"
+		if state, ok := states[r.ID]; ok && state.ConfigVersion == h.app.ConfigVersion() {
+			status, syncError = state.Status, state.Error
 		}
+		items = append(items, NodeRunningRule{ID: r.ID, Name: r.Name, UserID: r.UserID, RuleGroupID: r.RuleGroupID, InboundGroup: r.InboundGroupID,
+			ListenPort: r.ListenPort, ListenPortEnd: r.ListenPortEnd, OutboundGroup: r.OutboundGroupID, Protocol: nodeRuleProtocol(r, byID[r.InboundGroupID]),
+			Targets: len(r.TargetList()), SyncStatus: status, SyncError: syncError, Enable: r.Enable && !n.Disabled})
 	}
 
 	response.OK(c, gin.H{

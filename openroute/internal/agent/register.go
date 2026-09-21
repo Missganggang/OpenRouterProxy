@@ -73,13 +73,15 @@ func (r *Registry) RegisterHandler(c *gin.Context) {
 
 	// 注册时维护节点在线状态：注册本身就是一次「我还活着」的声明。
 	now := time.Now().UTC()
+	wasOnline := node.Online
 	updates := map[string]interface{}{
-		"online":         true,
-		"last_seen":      now,
-		"client_ver":     util.Truncate(req.Version, 32),
-		"config_version": req.ConfigVersion,
-		"last_error":     "",
-		"updated_at":     now,
+		"disable_execute": req.DisableExecute,
+		"online":          true,
+		"last_seen":       now,
+		"client_ver":      util.Truncate(req.Version, 32),
+		"config_version":  req.ConfigVersion,
+		"last_error":      "",
+		"updated_at":      now,
 	}
 	applySystemInfo(updates, req.System)
 
@@ -94,6 +96,10 @@ func (r *Registry) RegisterHandler(c *gin.Context) {
 	node.LastSeen = &now
 	applySystemInfoToNode(node, req.System)
 	node.ClientVer = util.Truncate(req.Version, 32)
+	node.DisableExecute = req.DisableExecute
+	if !wasOnline && r.app.Alert != nil {
+		r.app.Alert.NotifyEvent(ctx, app.EventNodeOnline, map[string]interface{}{"node_id": node.ID, "name": node.Name})
+	}
 
 	// 注册等价于一次首连：广播上线事件，WebUI 立即把节点刷成在线。
 	r.app.Hub().Broadcast(app.Event{
@@ -168,18 +174,20 @@ func (r *Registry) HeartbeatHandler(c *gin.Context) {
 	wasOnline := node.Online
 
 	updates := map[string]interface{}{
-		"online":         true,
-		"last_seen":      now,
-		"config_version": req.ConfigVersion,
-		"cpu_usage":      clampMetrics(req.Metrics.CPU),
-		"mem_used":       req.Metrics.MemUsed,
-		"disk_used":      req.Metrics.DiskUsed,
-		"net_in_speed":   req.Metrics.NetInSpeed,
-		"net_out_speed":  req.Metrics.NetOutSpeed,
-		"load1":          req.Metrics.Load1,
-		"uptime":         req.Metrics.Uptime,
-		"current_conn":   req.Metrics.TcpConn + req.Metrics.UdpConn,
-		"updated_at":     now,
+		"disable_execute": req.DisableExecute,
+		"config_hash":     util.Truncate(req.ConfigHash, 64),
+		"online":          true,
+		"last_seen":       now,
+		"config_version":  req.ConfigVersion,
+		"cpu_usage":       clampMetrics(req.Metrics.CPU),
+		"mem_used":        req.Metrics.MemUsed,
+		"disk_used":       req.Metrics.DiskUsed,
+		"net_in_speed":    req.Metrics.NetInSpeed,
+		"net_out_speed":   req.Metrics.NetOutSpeed,
+		"load1":           req.Metrics.Load1,
+		"uptime":          req.Metrics.Uptime,
+		"current_conn":    req.Metrics.TcpConn + req.Metrics.UdpConn,
+		"updated_at":      now,
 	}
 	if req.Version != "" {
 		updates["client_ver"] = util.Truncate(req.Version, 32)
@@ -200,9 +208,17 @@ func (r *Registry) HeartbeatHandler(c *gin.Context) {
 	// 写入探针指标。失败不影响心跳（指标是旁路数据），仅记日志。
 	r.recordProbe(ctx, node.ID, req.Metrics)
 	// 漂移检测：把节点上报的运行规则与面板期望配置比对（规格书 6.14）。
-	r.checkDrift(ctx, node.ID, req.RunningRules)
+	drifted := false
+	if req.ConfigHash != "" {
+		drifted = r.checkConfigDrift(ctx, node, req)
+	} else {
+		r.checkDrift(ctx, node.ID, req.RunningRules)
+	}
 
 	if !wasOnline {
+		if r.app.Alert != nil {
+			r.app.Alert.NotifyEvent(ctx, app.EventNodeOnline, map[string]interface{}{"node_id": node.ID, "name": node.Name})
+		}
 		r.app.Hub().Broadcast(app.Event{
 			Type: "node_online",
 			Data: map[string]interface{}{
@@ -215,7 +231,7 @@ func (r *Registry) HeartbeatHandler(c *gin.Context) {
 
 	// 节点上报的版本落后于面板当前版本 → 需要拉配置。
 	current := r.app.ConfigVersion()
-	needConfig := req.ConfigVersion < current
+	needConfig := req.ConfigVersion != current || drifted
 
 	resp := HeartbeatResponse{
 		NeedConfig:        needConfig,
@@ -224,10 +240,8 @@ func (r *Registry) HeartbeatHandler(c *gin.Context) {
 		ServerTime:        now.Unix(),
 	}
 	// 需要新配置时顺手把待执行任务带回去，省一次轮询。
-	if needConfig {
-		if tasks, err := r.pendingTasks(ctx, node.ID); err == nil {
-			resp.Tasks = tasks
-		}
+	if tasks, err := r.pendingTasks(ctx, node.ID); err == nil {
+		resp.Tasks = tasks
 	}
 	c.JSON(http.StatusOK, resp)
 }

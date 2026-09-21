@@ -60,6 +60,11 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const user = useAuthStore((state) => state.user)
+  return user?.role === 'admin' ? <>{children}</> : <Navigate to="/forward-rules" replace />
+}
+
 export default function App() {
   return (
     <Routes>
@@ -88,23 +93,23 @@ export default function App() {
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<DashboardPage />} />
 
-        <Route path="/nodes" element={<NodesPage />} />
-        <Route path="/nodes/:id" element={<NodeDetailPage />} />
-        <Route path="/node-groups" element={<NodeGroupsPage />} />
+        <Route path="/nodes" element={<RequireAdmin><NodesPage /></RequireAdmin>} />
+        <Route path="/nodes/:id" element={<RequireAdmin><NodeDetailPage /></RequireAdmin>} />
+        <Route path="/node-groups" element={<RequireAdmin><NodeGroupsPage /></RequireAdmin>} />
 
-        <Route path="/device-groups" element={<DeviceGroupsPage />} />
+        <Route path="/device-groups" element={<RequireAdmin><DeviceGroupsPage /></RequireAdmin>} />
 
         <Route path="/forward-rules" element={<ForwardRulesPage />} />
-        <Route path="/rule-groups" element={<RuleGroupsPage />} />
+        <Route path="/rule-groups" element={<RequireAdmin><RuleGroupsPage /></RequireAdmin>} />
 
-        <Route path="/users" element={<UsersPage />} />
+        <Route path="/users" element={<RequireAdmin><UsersPage /></RequireAdmin>} />
 
         <Route path="/traffic" element={<TrafficPage />} />
-        <Route path="/monitor" element={<MonitorPage />} />
-        <Route path="/alerts" element={<AlertsPage />} />
-        <Route path="/snapshots" element={<SnapshotsPage />} />
-        <Route path="/migration" element={<MigrationPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/monitor" element={<RequireAdmin><MonitorPage /></RequireAdmin>} />
+        <Route path="/alerts" element={<RequireAdmin><AlertsPage /></RequireAdmin>} />
+        <Route path="/snapshots" element={<RequireAdmin><SnapshotsPage /></RequireAdmin>} />
+        <Route path="/migration" element={<RequireAdmin><MigrationPage /></RequireAdmin>} />
+        <Route path="/settings" element={<RequireAdmin><SettingsPage /></RequireAdmin>} />
       </Route>
 
       <Route path="*" element={<NotFoundPage />} />

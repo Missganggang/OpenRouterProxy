@@ -25,6 +25,7 @@ type Handlers struct {
 	agent *agent.Registry
 	// terminalCounter 统计每个用户当前打开的 WebSSH 终端数（规格书 8.17）。
 	terminalCounter counter
+	terminalBroker  terminalBroker
 }
 
 // NewHandlers 构造 handler 集合。

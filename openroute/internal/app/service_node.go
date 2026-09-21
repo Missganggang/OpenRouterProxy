@@ -75,6 +75,7 @@ type NodeCreateInput struct {
 //
 // 使用指针区分「未传」与「显式传 0 / 空串」，避免前端局部更新把字段清空。
 type NodeUpdateInput struct {
+	Disabled    *bool     `json:"disabled"`
 	Name        *string   `json:"name"`
 	Role        *string   `json:"role"`
 	GroupIDs    *[]uint64 `json:"group_ids"`
@@ -313,6 +314,9 @@ func (s *NodeService) Update(ctx context.Context, id uint64, in NodeUpdateInput)
 	}
 
 	updates := map[string]interface{}{}
+	if in.Disabled != nil {
+		updates["disabled"] = *in.Disabled
+	}
 	if in.Name != nil {
 		name := strings.TrimSpace(*in.Name)
 		if name == "" {
@@ -727,7 +731,7 @@ func (s *NodeService) BatchDisable(ctx context.Context, in NodeBatchDisableInput
 	res := &NodeBatchResult{Succeeded: []uint64{}, Failed: []NodeBatchFailure{}}
 	for i := range nodes {
 		updates := map[string]interface{}{
-			"online":     false,
+			"disabled":   in.Disable,
 			"updated_at": timeNow(),
 		}
 		if in.Disable {
@@ -873,7 +877,7 @@ func (s *NodeService) requireOnline(n *model.Node) error {
 // 之所以把 DISABLE_EXECUTE 作为错误上报而不是静默忽略，是因为
 // 面板必须让运维知道「命令没有下发」而不是「已经下发但没生效」。
 func (s *NodeService) requireExecutable(n *model.Node) error {
-	if isExecDisabled(n.LastError) {
+	if n.DisableExecute || isExecDisabled(n.LastError) {
 		return response.New(response.CodeForbidden,
 			"节点已设置 DISABLE_EXECUTE=1，拒绝远程执行与升级")
 	}

@@ -14,9 +14,11 @@ const (
 // 节点是部署在转发服务器上的 Go 程序，接受面板下发配置并执行转发。
 // 网络信息字段由节点上报覆盖，面板不手工维护。
 type Node struct {
-	ID    uint64 `gorm:"primaryKey" json:"id"`
-	Name  string `gorm:"size:64;uniqueIndex;not null" json:"name"`
-	Token string `gorm:"size:64;uniqueIndex;not null" json:"token"` // 节点密钥，安装时下发
+	ID            uint64 `gorm:"primaryKey" json:"id"`
+	Name          string `gorm:"size:64;uniqueIndex;not null" json:"name"`
+	Token         string `gorm:"size:64;uniqueIndex;not null" json:"token"` // 节点密钥，安装时下发
+	TunnelTLSCert string `gorm:"type:text" json:"-"`
+	TunnelTLSKey  string `gorm:"type:text" json:"-"`
 	// 角色：inbound(入口) / outbound(出口) / both(双端)
 	Role string `gorm:"size:16;default:both" json:"role"`
 
@@ -39,10 +41,13 @@ type Node struct {
 	GroupIDs JSON `gorm:"type:text" json:"group_ids"`
 
 	// 状态
-	Online   bool       `gorm:"default:false;index" json:"online"`
-	LastSeen *time.Time `json:"last_seen"`
-	Weight   int        `gorm:"default:1" json:"weight"`   // 负载均衡权重
-	MaxConn  int        `gorm:"default:0" json:"max_conn"` // 本机最大连接数，0 = 不限
+	Online         bool       `gorm:"default:false;index" json:"online"`
+	Disabled       bool       `gorm:"default:false;index" json:"disabled"`
+	DisableExecute bool       `gorm:"default:false" json:"disable_execute"`
+	ConfigHash     string     `gorm:"size:64" json:"config_hash"`
+	LastSeen       *time.Time `json:"last_seen"`
+	Weight         int        `gorm:"default:1" json:"weight"`   // 负载均衡权重
+	MaxConn        int        `gorm:"default:0" json:"max_conn"` // 本机最大连接数，0 = 不限
 
 	// 系统信息（探针上报）
 	OS        string     `gorm:"size:64" json:"os"`

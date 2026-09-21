@@ -21,6 +21,8 @@ type Config struct {
 	DataDir        string `yaml:"-"`
 	BindInbound    string `yaml:"-"`
 	CountInterface string `yaml:"-"`
+	DisableExecute bool   `yaml:"disable-execute"`
+	ConfigPath     string `yaml:"-"`
 }
 
 // LoadConfig allows CLI credentials to override the file for old systemd units.
@@ -56,6 +58,10 @@ func LoadConfig(path, baseURL, token string) (Config, error) {
 	}
 	cfg.BindInbound = os.Getenv("BIND_INBOUND")
 	cfg.CountInterface = os.Getenv("COUNT_INTERFACE")
+	cfg.ConfigPath, _ = filepath.Abs(path)
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("DISABLE_EXECUTE"))); v == "1" || v == "true" || v == "yes" {
+		cfg.DisableExecute = true
+	}
 	if id := strings.TrimSpace(os.Getenv("UUID")); id != "" {
 		cfg.MachineID = id
 	}
@@ -105,5 +111,8 @@ func atomicWrite(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }

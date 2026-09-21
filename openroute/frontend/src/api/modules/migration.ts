@@ -1,3 +1,4 @@
+import { migrationReport, type MigrationReportResponse } from '../reportAdapters'
 /** 迁移与备份接口（规格书 8.15）。 */
 import { get, getList, post, download } from '../client'
 import type { MigrateBatch, Backup, PageQuery } from '../types'
@@ -47,13 +48,14 @@ export interface PrecheckInput {
 }
 
 /** 执行迁移预检（不写任何数据）。 */
-export function precheck(input: PrecheckInput) {
-  return post<PrecheckReport>('/migrations/precheck', input)
+export async function precheck(input: PrecheckInput): Promise<PrecheckReport> {
+  return migrationReport(await post<MigrationReportResponse>('/migrations/precheck', input, { timeout: 300000 }))
 }
 
 /** 执行迁移；dry_run 为 true 时只预览。 */
 export function run(input: PrecheckInput & { dry_run?: boolean }) {
-  return post<MigrateBatch>('/migrations/run', input, {
+  return post<{ batch_id: number; report: MigrationReportResponse; text: string; passed: boolean; backup_path?: string }>('/migrations/run', input, {
+    timeout: 0,
     params: { dry_run: input.dry_run ?? false },
   })
 }
@@ -100,7 +102,7 @@ export function createBackup(withSecret = false) {
 
 /** 下载备份。 */
 export function downloadBackup(id: number, name: string) {
-  return download(`/api/v1/backups/${id}/download`, undefined, `${name}.zip`)
+  return download(`/backups/${id}/download`, undefined, `${name}.zip`)
 }
 
 /** 从备份恢复。 */

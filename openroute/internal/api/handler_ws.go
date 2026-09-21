@@ -2,8 +2,8 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -16,18 +16,25 @@ import (
 	"github.com/openroute/openroute/internal/api/response"
 	"github.com/openroute/openroute/internal/app"
 	"github.com/openroute/openroute/internal/model"
+	"github.com/openroute/openroute/internal/nodestream"
 	"github.com/openroute/openroute/internal/util"
 )
 
 // wsUpgrader 是 WebSocket 升级器。
 //
-// CheckOrigin 放行全部来源：面板通常以 IP:端口 直接访问，
-// 且真正的权限边界是认证中间件而非 Origin。
-// 浏览器在跨域 WebSocket 场景下也会带上 Cookie，因此这里不能依赖 Origin 做隔离。
+// Browsers must connect from the panel origin because cookies authenticate the
+// socket. Node clients omit Origin and authenticate with their node token.
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		u, err := url.Parse(origin)
+		return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host)
+	},
 	// 允许子协议协商，便于前端未来扩展。
 	Subprotocols: []string{"openroute.v1"},
 }
@@ -177,62 +184,60 @@ func (h *Handlers) NodeStream(c *gin.Context) {
 		response.Abort(c, response.New(response.CodeNodeTokenInvalid, ""))
 		return
 	}
-
 	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		h.log.Debug("节点 WebSocket 升级失败", zap.Error(err), zap.Uint64("node_id", node.ID))
 		return
 	}
-	defer func() { _ = conn.Close() }()
-
+	defer conn.Close()
+	lease := h.terminalBroker.attach(node.ID, node.DisableExecute)
+	defer h.terminalBroker.detach(node.ID, lease)
 	events, cancel := h.app.Hub().Subscribe("node:"+utoa(node.ID), node.ID)
 	defer cancel()
-
-	// 首帧告知节点当前的配置版本，节点据此决定是否立即拉取。
-	if err := writeJSON(conn, app.Event{
-		Type: "hello",
-		Data: gin.H{
-			"config_version":     h.app.ConfigVersion(),
-			"heartbeat_interval": h.app.Config.HeartbeatInterval,
-		},
-	}); err != nil {
+	if writeJSON(conn, app.Event{Type: "hello", Data: gin.H{"config_version": h.app.ConfigVersion(), "heartbeat_interval": h.app.Config.HeartbeatInterval}}) != nil {
 		return
 	}
-
-	conn.SetReadLimit(4096)
+	conn.SetReadLimit(128 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	})
-
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(wsPongWait)) })
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			var message nodestream.Message
+			if conn.ReadJSON(&message) != nil {
 				return
 			}
+			_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+			if message.Type == "node_hello" {
+				h.terminalBroker.setDisabled(node.ID, lease, message.Data.DisableExecute)
+				continue
+			}
+			// Authentication fixes the node identity; session IDs cannot route output to another node.
+			h.terminalBroker.receive(node.ID, lease, message)
 		}
 	}()
-
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-done:
 			return
+		case <-lease.done:
+			return
 		case <-h.app.Done():
 			return
 		case ev, ok := <-events:
-			if !ok {
-				return
-			}
-			if err := writeJSON(conn, ev); err != nil {
+			if !ok || writeJSON(conn, ev) != nil {
 				return
 			}
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)); err != nil {
+			// Token rotation/deletion and disabling execution take effect on existing streams too.
+			var current model.Node
+			if h.app.DB.WithContext(c.Request.Context()).First(&current, node.ID).Error != nil || current.Token != node.Token {
+				return
+			}
+			h.terminalBroker.setDisabled(node.ID, lease, current.DisableExecute)
+			if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)) != nil {
 				return
 			}
 		}
@@ -252,122 +257,124 @@ func (h *Handlers) NodeStream(c *gin.Context) {
 //	浏览器发：JSON 文本帧 {"type":"input","data":"..."} / {"type":"resize","cols":80,"rows":24}
 //	面板发：JSON 文本帧 {"type":"output","data":"..."} / {"type":"error","message":"..."}
 //
-// 说明：节点侧的 SSH 转发由节点客户端实现（其通过 /api/node/tasks 的
-// exec 通道执行），面板在这里负责鉴权、并发控制、大小同步与审计。
+// The node opens a PTY and sends output on its authenticated control connection.
 func (h *Handlers) NodeTerminal(c *gin.Context) {
-	// 1. 功能开关
-	if !h.app.Config.EnableWebSSH {
-		response.Abort(c, response.New(response.CodeWebSSHDisabled,
-			"WebSSH 已在 config.yml 中被禁用（enable-webssh: false）"))
+	if !middleware.IsAdmin(c) {
+		response.Abort(c, response.New(response.CodeForbidden, "Only administrators may open node terminals"))
 		return
 	}
-
+	if !h.app.Config.EnableWebSSH {
+		response.Abort(c, response.New(response.CodeWebSSHDisabled, "WebSSH is disabled"))
+		return
+	}
 	id, ok := pathID(c, "id")
 	if !ok {
-		badRequest(c, "id", "节点 ID 必须是正整数")
+		badRequest(c, "id", "invalid node ID")
 		return
 	}
-
 	node, err := h.app.Node.Get(c.Request.Context(), id)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-
-	// 2. 并发终端数限制（按用户维度）
+	if node.DisableExecute {
+		response.Abort(c, response.New(response.CodeWebSSHDisabled, "DISABLE_EXECUTE=1"))
+		return
+	}
+	sid, output, ok := h.terminalBroker.open(id)
+	if !ok {
+		response.Abort(c, response.New(response.CodeNodeOffline, "Node has no active control connection or execution is disabled"))
+		return
+	}
+	defer h.terminalBroker.close(sid)
 	uid, un, _, _ := middleware.CurrentUser(c)
 	key := "term:" + utoa(uid)
-	if n := h.terminalCounter.increment(key); n > terminalMaxSessionsPerUser {
+	if h.terminalCounter.increment(key) > terminalMaxSessionsPerUser {
 		h.terminalCounter.decrement(key)
-		response.Abort(c, response.New(response.CodeRateLimited,
-			"每个用户最多同时打开 "+itoa(terminalMaxSessionsPerUser)+" 个终端，请先关闭其它终端"))
+		response.Abort(c, response.New(response.CodeRateLimited, "At most three terminals per user"))
 		return
 	}
 	defer h.terminalCounter.decrement(key)
-
-	// 3. 审计：每次打开终端都要留痕（规格书 6.1 的 MUST 要求）
-	ip := util.ClientIP(c.Request)
-	h.app.Audit.Write(c.Request.Context(), app.AuditEntry{
-		UserID:     uid,
-		Username:   un,
-		Action:     model.ActionExec,
-		Resource:   "node_terminal",
-		ResourceID: node.ID,
-		IP:         ip,
-		UserAgent:  c.GetHeader("User-Agent"),
-		Message:    "打开节点 " + node.Name + " 的 WebSSH 终端",
-	})
-
-	// 4. 升级连接
 	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		h.log.Debug("终端 WebSocket 升级失败", zap.Error(err))
 		return
 	}
-	defer func() { _ = conn.Close() }()
-
-	// 5. 节点必须在线才能转发
-	if !node.Online {
-		_ = writeJSON(conn, gin.H{
-			"type":    "error",
-			"message": "节点 " + node.Name + " 当前离线，无法打开终端。请先让节点上线。",
-		})
+	defer conn.Close()
+	sendNode := func(kind string, payload nodestream.Payload) bool {
+		payload.SessionID = sid
+		return h.app.Hub().BroadcastToNode(id, app.Event{Type: kind, Data: payload})
+	}
+	if !sendNode("terminal_open", nodestream.Payload{Cols: 80, Rows: 24}) {
+		_ = writeJSON(conn, gin.H{"type": "error", "message": "Node disconnected"})
 		return
 	}
-
-	// 6. 通知节点开启一个终端会话。
-	//
-	// 设计说明：本版本通过节点长连接下发"打开终端"任务，
-	// 节点侧建立 SSH 会话并把字节流通过后续的 report 通道回传。
-	// 若节点未建立长连接（例如节点客户端版本较旧），明确告知用户。
-	if !h.app.Hub().NodeConnected(node.ID) {
-		_ = writeJSON(conn, gin.H{
-			"type": "error",
-			"message": "节点 " + node.Name +
-				" 未建立长连接，无法转发终端会话。请确认节点客户端版本并重启节点服务。",
-		})
-		return
-	}
-
-	_ = writeJSON(conn, gin.H{
-		"type":    "ready",
-		"node_id": node.ID,
-		"message": "会话已建立",
-	})
-
-	conn.SetReadLimit(1 << 20)
+	defer sendNode("terminal_close", nodestream.Payload{})
+	h.app.Audit.Write(c.Request.Context(), app.AuditEntry{UserID: uid, Username: un, Action: model.ActionExec, Resource: "node_terminal", ResourceID: id, IP: util.ClientIP(c.Request), UserAgent: c.GetHeader("User-Agent"), Message: "Open node terminal " + node.Name})
+	conn.SetReadLimit(64 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
-	})
-
-	// 7. 读取浏览器输入并转发给节点。
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(wsPongWait)) })
+	input := make(chan terminalMessage, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			var msg terminalMessage
+			if conn.ReadJSON(&msg) != nil {
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+			select {
+			case input <- msg:
+			case <-c.Request.Context().Done():
+				return
+			case <-h.app.Done():
+				return
+			default:
+				return
+			}
+		}
+	}()
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
 	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
+		select {
+		case <-done:
 			return
-		}
-
-		var msg terminalMessage
-		if err := json.Unmarshal(raw, &msg); err != nil {
-			// 非法消息直接忽略，不中断会话。
-			continue
-		}
-
-		switch msg.Type {
-		case "input":
-			h.app.Hub().BroadcastToNode(node.ID, app.Event{
-				Type: "terminal_input",
-				Data: gin.H{"data": msg.Data},
-			})
-		case "resize":
-			// 窗口尺寸同步（规格书 6.1 要求支持）
-			h.app.Hub().BroadcastToNode(node.ID, app.Event{
-				Type: "terminal_resize",
-				Data: gin.H{"cols": msg.Cols, "rows": msg.Rows},
-			})
-		case "ping":
-			if err := writeJSON(conn, gin.H{"type": "pong"}); err != nil {
+		case <-h.app.Done():
+			return
+		case <-c.Request.Context().Done():
+			return
+		case msg, ok := <-output:
+			if !ok {
+				_ = writeJSON(conn, gin.H{"type": "closed", "message": "Node control connection closed"})
+				return
+			}
+			kind := strings.TrimPrefix(msg.Type, "terminal_")
+			if writeJSON(conn, gin.H{"type": kind, "data": msg.Data.Data, "message": msg.Data.Message, "node_id": id}) != nil {
+				return
+			}
+			if kind == "error" || kind == "closed" {
+				return
+			}
+		case msg := <-input:
+			switch msg.Type {
+			case "input":
+				if !sendNode("terminal_input", nodestream.Payload{Data: msg.Data}) {
+					return
+				}
+			case "resize":
+				if msg.Cols > 0 && msg.Cols <= 500 && msg.Rows > 0 && msg.Rows <= 300 {
+					if !sendNode("terminal_resize", nodestream.Payload{Cols: msg.Cols, Rows: msg.Rows}) {
+						return
+					}
+				}
+			case "ping":
+				if writeJSON(conn, gin.H{"type": "pong"}) != nil {
+					return
+				}
+			}
+		case <-ticker.C:
+			if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)) != nil {
 				return
 			}
 		}
