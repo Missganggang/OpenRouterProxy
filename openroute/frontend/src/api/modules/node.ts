@@ -18,6 +18,11 @@ export interface NodeCreateInput {
   max_conn?: number
   connect_host?: string
   is_static?: boolean
+  direct_port?: number
+  ws_port?: number
+  tls_port?: number
+  udp_port?: number
+  rev_port?: number
   remark?: string
 }
 

@@ -427,14 +427,15 @@ func (b *ConfigBuilder) resolvePeers(g *model.DeviceGroup, peers map[uint64]*mod
 		if n == nil {
 			continue
 		}
-		host, connectPort := resolveConnectAddress(g, n)
-		ports := nodePorts(n)
+		host, _ := resolveConnectAddress(g, n)
+		ports := nodeConnectPorts(n)
 		wsPort := ports.WsPort
 		// 静态连接地址显式给了端口时，用它覆盖节点上报的 ws 端口，
 		// 这是「域名 + 非默认端口」部署模式下唯一可靠的连接端口来源。
-		if connectPort > 0 && strings.EqualFold(fmt.Sprint(rawOptions(g.Config)["connect_type"]), "static") {
+		if connectPort := staticTCPPort(g); connectPort > 0 {
 			wsPort = connectPort
-			ports.DirectPort, ports.TlsPort, ports.UdpPort = connectPort, connectPort, connectPort
+			// A group TCP port must not redirect native UDP to an unrelated port.
+			ports.DirectPort, ports.TlsPort = connectPort, connectPort
 		}
 		_, _, tlsPin, err := b.nodeCertificate(n.ID)
 		if err != nil {
@@ -483,7 +484,7 @@ func resolveConnectAddress(g *model.DeviceGroup, n *model.Node) (string, int) {
 	if g != nil {
 		_ = jsonUnmarshal(string(g.Config), &cfg)
 	}
-	ports := nodePorts(n)
+	ports := nodeConnectPorts(n)
 	port := ports.WsPort
 	switch cfg.Protocol {
 	case "direct":
@@ -494,7 +495,7 @@ func resolveConnectAddress(g *model.DeviceGroup, n *model.Node) (string, int) {
 	if cfg.ConnectPort <= 0 {
 		cfg.ConnectPort = port
 	}
-	host := n.ConnectHost
+	host := n.TunnelHost()
 	if host == "" && n.IsStatic {
 		host = n.PrivateIP
 	}

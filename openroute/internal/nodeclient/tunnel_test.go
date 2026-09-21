@@ -15,20 +15,56 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
+var testPortPool struct {
+	sync.Mutex
+	initialized                 bool
+	offset, next                int
+	ephemeralLow, ephemeralHigh int
+}
+
 func testPort(t *testing.T) int {
 	t.Helper()
-	for {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// The production engine opens listeners from port numbers, so the helper
+	// cannot retain the probe sockets. Never recycle a number within this test
+	// process, and keep candidates out of the kernel's outbound ephemeral pool.
+	// This also avoids collisions with the :0 echo servers used by these tests.
+	const firstPort, portCount = 10000, 65536 - 10000
+	testPortPool.Lock()
+	defer testPortPool.Unlock()
+	if !testPortPool.initialized {
+		offset, err := rand.Int(rand.Reader, big.NewInt(portCount))
 		if err != nil {
 			t.Fatal(err)
 		}
-		port := ln.Addr().(*net.TCPAddr).Port
+		testPortPool.offset = int(offset.Int64())
+		// Conservative fallback covers standard Linux, Windows and macOS ranges.
+		testPortPool.ephemeralLow, testPortPool.ephemeralHigh = 32768, 65535
+		if data, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+			var low, high int
+			if _, err := fmt.Sscanf(string(data), "%d %d", &low, &high); err == nil && low >= 1 && high <= 65535 && low <= high {
+				testPortPool.ephemeralLow, testPortPool.ephemeralHigh = low, high
+			}
+		}
+		testPortPool.initialized = true
+	}
+	for testPortPool.next < portCount {
+		port := firstPort + (testPortPool.offset+testPortPool.next)%portCount
+		testPortPool.next++
+		if port >= testPortPool.ephemeralLow && port <= testPortPool.ephemeralHigh {
+			continue
+		}
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
 		udp, udpErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
 		if udpErr != nil {
 			ln.Close()
@@ -38,6 +74,8 @@ func testPort(t *testing.T) int {
 		ln.Close()
 		return port
 	}
+	t.Fatal("no unused TCP/UDP test port outside the ephemeral range")
+	return 0
 }
 func testCertificate(t *testing.T) (string, string, string) {
 	t.Helper()

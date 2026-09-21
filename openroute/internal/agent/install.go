@@ -407,30 +407,59 @@ SERVICE_NAME="${S:-${SERVICE_NAME}}"
 ARCH_HINT={{sh .Arch}}
 NODE_VERSION={{sh .Version}}
 IS_OUTBOUND={{.IsOutbound}}
+OUTBOUND_EXPLICIT=0
+NETWORK_ARGS=()
 
 info() { printf '[OpenRoute] %s\n' "$*"; }
 warn() { printf '[OpenRoute] 警告：%s\n' "$*" >&2; }
 fail() { printf '[OpenRoute] 安装失败：%s\n' "$*" >&2; exit 1; }
 usage() {
   echo "用法：bash install.sh -u 面板地址 -t 节点密钥 [-s 服务名] [-o 0|1] [-a auto|amd64|amd64v3|arm64] [-v 版本]"
+  echo "网络参数：--connect-host 本机可达IP或域名；--direct-port / --ws-port / --tls-port / --udp-port / --rev-port 本地监听端口"
+  echo "映射端口：--connect-direct-port / --connect-ws-port / --connect-tls-port / --connect-udp-port / --connect-rev-port"
+  echo "长参数支持 --参数 值 或 --参数=值。端口 0 表示继承；重装未指定的本地配置保持不变。"
 }
-while getopts ":u:t:s:o:a:v:h" option; do
+single_line() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
+while [ "$#" -gt 0 ]; do
+  option="$1"
   case "$option" in
-    u) PANEL_URL="$OPTARG" ;;
-    t) NODE_TOKEN="$OPTARG" ;;
-    s) SERVICE_NAME="$OPTARG" ;;
-    o) IS_OUTBOUND="$OPTARG" ;;
-    a) ARCH_HINT="$OPTARG" ;;
-    v) NODE_VERSION="$OPTARG" ;;
-    h) usage; exit 0 ;;
-    :) fail "选项 -${OPTARG} 缺少参数" ;;
-    *) usage >&2; fail "未知选项 -${OPTARG}" ;;
+    -h|--help) usage; exit 0 ;;
+    -u|-t|-s|-o|-a|-v)
+      [ "$#" -ge 2 ] || fail "选项 ${option} 缺少参数"
+      value="$2"; shift 2
+      ;;
+    -u?*|-t?*|-s?*|-o?*|-a?*|-v?*)
+      value="${option:2}"; option="${option:0:2}"; shift
+      ;;
+    --connect-host|--direct-port|--ws-port|--tls-port|--udp-port|--rev-port|--connect-direct-port|--connect-ws-port|--connect-tls-port|--connect-udp-port|--connect-rev-port)
+      [ "$#" -ge 2 ] || fail "选项 ${option} 缺少参数"
+      value="$2"; shift 2
+      ;;
+    --connect-host=*|--direct-port=*|--ws-port=*|--tls-port=*|--udp-port=*|--rev-port=*|--connect-direct-port=*|--connect-ws-port=*|--connect-tls-port=*|--connect-udp-port=*|--connect-rev-port=*)
+      value="${option#*=}"; option="${option%%=*}"; shift
+      ;;
+    --) shift; [ "$#" -eq 0 ] || fail "不支持的位置参数：$*"; break ;;
+    *) usage >&2; fail "未知选项或位置参数 ${option}" ;;
+  esac
+  case "$option" in
+    -u) PANEL_URL="$value" ;;
+    -t) NODE_TOKEN="$value" ;;
+    -s) SERVICE_NAME="$value" ;;
+    -o) IS_OUTBOUND="$value"; OUTBOUND_EXPLICIT=1 ;;
+    -a) ARCH_HINT="$value" ;;
+    -v) NODE_VERSION="$value" ;;
+    --connect-host)
+      single_line "$value" || fail "连接地址不能包含换行"
+      NETWORK_ARGS+=("${option}=${value}")
+      ;;
+    --*-port)
+      [[ "$value" =~ ^[0-9]+$ ]] && [ "${#value}" -le 5 ] && [ "$((10#$value))" -le 65535 ] || fail "${option} 必须为 0 至 65535 的整数"
+      value="$((10#$value))"
+      NETWORK_ARGS+=("${option}=${value}")
+      ;;
   esac
 done
-shift "$((OPTIND - 1))"
-[ "$#" -eq 0 ] || fail "不支持的位置参数：$*"
 
-single_line() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
 [ -n "$PANEL_URL" ] || fail "缺少面板地址，请使用 -u"
 [ -n "$NODE_TOKEN" ] || fail "缺少节点密钥，请从面板复制安装命令（-t）"
 single_line "$NODE_TOKEN" || fail "节点密钥不能包含换行"
@@ -518,47 +547,20 @@ MACHINE_UUID="${UUID:-}"
 if [ -z "$MACHINE_UUID" ] && [ -s "$MACHINE_ID_PATH" ]; then
   MACHINE_UUID="$(cat "$MACHINE_ID_PATH")"
 fi
-if [ -z "$MACHINE_UUID" ]; then
-  if [ -r /proc/sys/kernel/random/uuid ]; then
-    MACHINE_UUID="$(cat /proc/sys/kernel/random/uuid)"
-  else
-    MACHINE_UUID="$(date +%s%N)"
-  fi
-fi
 single_line "$MACHINE_UUID" || fail "UUID 不能包含换行"
-yaml_quote() {
-  local value="$1"
-  value="${value//\'/\'\'}"
-  printf "'%s'" "$value"
-}
-cat > "$TMP_CONFIG" <<YAML
-# OpenRoute 节点配置；修改后重启节点服务。
-base-url: $(yaml_quote "$PANEL_URL")
-token: $(yaml_quote "$NODE_TOKEN")
-is-outbound: ${IS_OUTBOUND}
-use-ech: false
-ech-query-name: ""
-direct-port: 0
-ws-port: 0
-tls-port: 0
-udp-port: 0
-rev-port: 0
-connect-host: ""
-connect-direct-port: 0
-connect-ws-port: 0
-connect-tls-port: 0
-connect-udp-port: 0
-connect-rev-port: 0
-default-weight: 1
-machine-id: $(yaml_quote "$MACHINE_UUID")
-YAML
+# Let the new client merge YAML; only explicitly supplied fields are replaced.
+# In particular, reinstalling must not reset local addresses, ports or custom keys.
+if [ ! -f "$CONFIG_PATH" ] || [ "$OUTBOUND_EXPLICIT" -eq 1 ]; then
+  NETWORK_ARGS+=("--is-outbound=${IS_OUTBOUND}")
+fi
+UUID="$MACHINE_UUID" "$TMP_BINARY" -c "$CONFIG_PATH" -u "$PANEL_URL" -t "$NODE_TOKEN" --write-config "$TMP_CONFIG" "${NETWORK_ARGS[@]}" || fail "配置合并失败；旧客户端和配置已保留"
 "$TMP_BINARY" -c "$TMP_CONFIG" -check || fail "配置自检失败；旧客户端和配置已保留"
 
 # 已存在的环境文件保留运维人员的自定义值。
 if [ ! -e "$ENV_PATH" ]; then
   TMP_ENV="$(mktemp "${INSTALL_DIR}/.env.XXXXXX")"
   printf '# OpenRoute 节点环境变量；修改后重启 %s\n' "$SERVICE_UNIT" > "$TMP_ENV"
-  for env_name in DISABLE_EXECUTE BIND_INBOUND BIND_OUTBOUND_4 BIND_OUTBOUND_6 OUTBOUND_FWMARK COUNT_INTERFACE HEALTH_CHECK UUID; do
+  for env_name in DISABLE_EXECUTE BIND_INBOUND BIND_OUTBOUND_4 BIND_OUTBOUND_6 OUTBOUND_FWMARK TUNNEL_BIND_INBOUND TUNNEL_BIND_OUTBOUND_4 TUNNEL_BIND_OUTBOUND_6 TUNNEL_FWMARK TUNNEL_INTERFACE COUNT_INTERFACE HEALTH_CHECK UUID; do
     env_value="${!env_name-}"
     if [ -n "$env_value" ]; then
       single_line "$env_value" || fail "${env_name} 不能包含换行"
@@ -576,8 +578,11 @@ fi
 
 mv -f -- "$TMP_BINARY" "$BINARY_PATH"
 mv -f -- "$TMP_CONFIG" "$CONFIG_PATH"
-printf '%s\n' "$MACHINE_UUID" > "$MACHINE_ID_PATH"
-chmod 0600 "$CONFIG_PATH" "$ENV_PATH" "$MACHINE_ID_PATH"
+chmod 0600 "$CONFIG_PATH" "$ENV_PATH"
+if [ -n "$MACHINE_UUID" ]; then
+  printf '%s\n' "$MACHINE_UUID" > "$MACHINE_ID_PATH"
+  chmod 0600 "$MACHINE_ID_PATH"
+fi
 
 # 本地卸载脚本绑定命令行解析后的服务实例。
 {
@@ -647,7 +652,7 @@ cat <<DONE
 安装目录：${INSTALL_DIR}
 配置文件：${CONFIG_PATH}
 环境变量：${ENV_PATH}
-实例标识：${MACHINE_UUID}
+实例标识：${MACHINE_UUID:-由客户端保留或生成}
 查看状态：systemctl status ${SERVICE_UNIT}
 查看日志：journalctl -fu ${SERVICE_UNIT}
 查看版本：${BINARY_PATH} -version

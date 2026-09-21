@@ -34,7 +34,8 @@ type Env struct {
 // token 放在 body 里而不是请求头，因为注册阶段节点还没有其它身份信息，
 // 且安装脚本已经把 token 写进了 config.yml。
 type RegisterRequest struct {
-	DisableExecute bool `json:"disable_execute"`
+	Network        *NodeNetworkConfig `json:"network,omitempty"`
+	DisableExecute bool               `json:"disable_execute"`
 	// Token 节点密钥，必填。
 	Token string `json:"token"`
 	// Version 节点客户端版本，如 nc20260101。
@@ -88,9 +89,10 @@ type RegisterResponse struct {
 //
 // metrics 子对象的字段名与示例逐字对应，不做任何重命名。
 type HeartbeatRequest struct {
-	DisableExecute bool   `json:"disable_execute"`
-	ConfigHash     string `json:"config_hash,omitempty"`
-	NodeID         uint64 `json:"node_id"`
+	Network        *NodeNetworkConfig `json:"network,omitempty"`
+	DisableExecute bool               `json:"disable_execute"`
+	ConfigHash     string             `json:"config_hash,omitempty"`
+	NodeID         uint64             `json:"node_id"`
 	// Version 节点客户端版本。
 	Version string `json:"version"`
 	// ConfigVersion 节点当前生效的配置版本；面板据此判断是否需要下发新配置。

@@ -18,6 +18,7 @@ import (
 	"github.com/openroute/openroute/internal/database"
 	"github.com/openroute/openroute/internal/model"
 	"github.com/openroute/openroute/internal/nodeclient"
+	"github.com/openroute/openroute/internal/nodeproto"
 	"go.uber.org/zap"
 )
 
@@ -51,7 +52,9 @@ func TestPanelTwoNodeTunnelTrafficAndDisable(t *testing.T) {
 	nodes := []model.Node{{ID: 1, Name: "integration-in", Token: "integration-ingress-token"}, {ID: 2, Name: "integration-out", Token: "integration-egress-token"}}
 	for i := range nodes {
 		n := &nodes[i]
-		n.ConnectHost = "127.0.0.1"
+		// Deliberately unreachable panel address: only the client's advertised
+		// private endpoint can make this end-to-end tunnel work.
+		n.ConnectHost = "192.0.2.99"
 		n.IsStatic = true
 		n.DirectPort = freePort()
 		n.WsPort = freePort()
@@ -111,7 +114,7 @@ func TestPanelTwoNodeTunnelTrafficAndDisable(t *testing.T) {
 		}
 	})
 	for _, n := range nodes {
-		client, err := nodeclient.NewClient(nodeclient.Config{BaseURL: server.URL, Token: n.Token, DataDir: t.TempDir(), BindInbound: "127.0.0.1", DisableExecute: true}, "integration-test", log.New(io.Discard, "", 0))
+		client, err := nodeclient.NewClient(nodeclient.Config{BaseURL: server.URL, Token: n.Token, DataDir: t.TempDir(), BindInbound: "127.0.0.1", DisableExecute: true, Network: nodeproto.NodeNetworkConfig{ConnectHost: "127.0.0.1"}}, "integration-test", log.New(io.Discard, "", 0))
 		if err != nil {
 			t.Fatal(err)
 		}

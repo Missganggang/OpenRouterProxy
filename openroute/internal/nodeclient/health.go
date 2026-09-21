@@ -4,7 +4,6 @@ import (
 	"github.com/openroute/openroute/internal/nodeproto"
 	"math"
 	"math/rand/v2"
-	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -246,8 +245,7 @@ func (f *forwarder) healthLoop() {
 			if f.group.HealthCheckEnable && now.Sub(lastTargets) >= time.Duration(max(f.group.HealthCheckInterval, 1))*time.Second {
 				lastTargets = now
 				for _, target := range f.targets {
-					dialer := net.Dialer{Timeout: time.Duration(max(f.group.HealthCheckTimeout, 1)) * time.Second}
-					conn, err := dialer.DialContext(f.ctx, "tcp", target.address)
+					conn, err := f.dialTargetAddress(f.ctx, "tcp", target.address, time.Duration(max(f.group.HealthCheckTimeout, 1))*time.Second)
 					if conn != nil {
 						conn.Close()
 					}

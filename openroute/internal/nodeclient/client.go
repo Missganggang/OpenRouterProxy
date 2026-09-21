@@ -54,6 +54,12 @@ type Client struct {
 }
 
 func NewClient(config Config, version string, logger *log.Logger) (*Client, error) {
+	if err := config.Network.Normalize(); err != nil {
+		return nil, err
+	}
+	if err := ValidateNetworkEnvironment(config.BindInbound); err != nil {
+		return nil, err
+	}
 	if err := config.ensureIdentity(); err != nil {
 		return nil, fmt.Errorf("initialize node identity: %w", err)
 	}
@@ -145,7 +151,7 @@ func (c *Client) Run(ctx context.Context) error {
 }
 
 func (c *Client) register(ctx context.Context) error {
-	request := nodeproto.RegisterRequest{Token: c.config.Token, Version: c.version, System: c.metrics.system(), ConfigVersion: c.configVersion, UUID: c.config.MachineID, DisableExecute: c.config.DisableExecute}
+	request := nodeproto.RegisterRequest{Token: c.config.Token, Version: c.version, System: c.metrics.system(), ConfigVersion: c.configVersion, UUID: c.config.MachineID, DisableExecute: c.config.DisableExecute, Network: &c.config.Network}
 	var response nodeproto.RegisterResponse
 	if err := c.request(ctx, http.MethodPost, "/api/node/register", request, &response); err != nil {
 		return err
@@ -167,7 +173,7 @@ func (c *Client) register(ctx context.Context) error {
 
 func (c *Client) heartbeat(ctx context.Context) error {
 	c.lastMetrics = c.metrics.sample()
-	request := nodeproto.HeartbeatRequest{NodeID: c.nodeID, Version: c.version, ConfigVersion: c.configVersion, ConfigHash: nodeproto.ConfigHash(c.effectiveConfig()), DisableExecute: c.config.DisableExecute, Metrics: c.lastMetrics, RunningRules: c.engine.RunningRules(), Timestamp: time.Now().Unix()}
+	request := nodeproto.HeartbeatRequest{NodeID: c.nodeID, Version: c.version, ConfigVersion: c.configVersion, ConfigHash: nodeproto.ConfigHash(c.effectiveConfig()), DisableExecute: c.config.DisableExecute, Metrics: c.lastMetrics, RunningRules: c.engine.RunningRules(), Timestamp: time.Now().Unix(), Network: &c.config.Network}
 	var response nodeproto.HeartbeatResponse
 	if err := c.request(ctx, http.MethodPost, "/api/node/heartbeat", request, &response); err != nil {
 		return err

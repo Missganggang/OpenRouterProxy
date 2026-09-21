@@ -140,7 +140,7 @@ func (f *forwarder) reverseOnce(peer nodeproto.GroupPeer) {
 	if port <= 0 {
 		return
 	}
-	conn, err := outboundDial(f.ctx, "tcp", net.JoinHostPort(peer.Host, strconv.Itoa(port)))
+	conn, err := f.dialTunnelAddress(f.ctx, "tcp", net.JoinHostPort(peer.Host, strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		return
 	}

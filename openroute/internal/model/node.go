@@ -28,7 +28,10 @@ type Node struct {
 	PrivateIP  string `gorm:"size:64" json:"private_ip"`
 	// 静态连接地址（出口用；为空则用上报的公网 IP）
 	ConnectHost string `gorm:"size:255" json:"connect_host"`
-	IsStatic    bool   `gorm:"default:false" json:"is_static"` // 对应配置 connect_type == "static"
+	// Client overrides remain separate from administrator values. A new client
+	// reports an empty object to clear them; old clients omitting it preserve them.
+	ReportedNetwork JSON `gorm:"type:text" json:"reported_network"`
+	IsStatic        bool `gorm:"default:false" json:"is_static"` // 对应配置 connect_type == "static"
 
 	// 端口配置
 	DirectPort int `gorm:"default:0" json:"direct_port"`

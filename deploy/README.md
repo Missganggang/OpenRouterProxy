@@ -1,5 +1,7 @@
 # 部署说明
 
+IPLC / IEPL、`--connect-host` 和专线网卡参数见 [专线配置指南](../openroute/docs/PRIVATE_LINES.md)。
+
 把 OpenRoute 部署到远端服务器。凭据不写进脚本，而是通过命令行参数传入。
 
 ## 目标环境

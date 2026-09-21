@@ -12,6 +12,7 @@ import (
 
 	"github.com/openroute/openroute/internal/api/response"
 	"github.com/openroute/openroute/internal/model"
+	"github.com/openroute/openroute/internal/nodeproto"
 	"github.com/openroute/openroute/internal/util"
 )
 
@@ -237,6 +238,11 @@ func (s *NodeService) Get(ctx context.Context, id uint64) (*model.Node, error) {
 // （为空时回退到配置的 listen 地址），用于拼装安装命令。
 // 返回创建结果或错误。
 func (s *NodeService) Create(ctx context.Context, in NodeCreateInput, baseURL string) (*NodeCreateResult, error) {
+	network := nodeproto.NodeNetworkConfig{ConnectHost: in.ConnectHost, DirectPort: in.DirectPort, WsPort: in.WsPort, TlsPort: in.TlsPort, UdpPort: in.UdpPort, RevPort: in.RevPort}
+	if err := network.Normalize(); err != nil {
+		return nil, response.Field(response.CodeParamInvalid, "network", nil, err.Error())
+	}
+	in.ConnectHost = network.ConnectHost
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return nil, response.Field(response.CodeParamInvalid, "name", in.Name, "节点名称不能为空")
@@ -352,7 +358,11 @@ func (s *NodeService) Update(ctx context.Context, id uint64, in NodeUpdateInput)
 		updates["max_conn"] = *in.MaxConn
 	}
 	if in.ConnectHost != nil {
-		updates["connect_host"] = util.Truncate(strings.TrimSpace(*in.ConnectHost), 255)
+		host, err := nodeproto.NormalizeConnectHost(*in.ConnectHost)
+		if err != nil {
+			return nil, response.Field(response.CodeParamInvalid, "connect_host", nil, err.Error())
+		}
+		updates["connect_host"] = host
 	}
 	if in.IsStatic != nil {
 		updates["is_static"] = *in.IsStatic
@@ -371,6 +381,11 @@ func (s *NodeService) Update(ctx context.Context, id uint64, in NodeUpdateInput)
 	}
 	if in.RevPort != nil {
 		updates["rev_port"] = *in.RevPort
+	}
+	for _, key := range []string{"direct_port", "ws_port", "tls_port", "udp_port", "rev_port"} {
+		if value, ok := updates[key].(int); ok && (value < 0 || value > 65535) {
+			return nil, response.Field(response.CodeParamOutOfRange, key, value, "端口必须为 0（继承）或 1～65535")
+		}
 	}
 	if in.GroupIDs != nil {
 		role := n.Role

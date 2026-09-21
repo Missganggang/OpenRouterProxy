@@ -76,6 +76,22 @@ func (b *ConfigBuilder) nodeCertificate(id uint64) (cert, key, pin string, err e
 
 func nodePorts(n *model.Node) nodeproto.NodeListeners {
 	ports := nodeproto.NodeListeners{DirectPort: n.DirectPort, WsPort: n.WsPort, TlsPort: n.TlsPort, UdpPort: n.UdpPort, RevPort: n.RevPort}
+	local := n.LocalNetwork()
+	if local.DirectPort > 0 {
+		ports.DirectPort = local.DirectPort
+	}
+	if local.WsPort > 0 {
+		ports.WsPort = local.WsPort
+	}
+	if local.TlsPort > 0 {
+		ports.TlsPort = local.TlsPort
+	}
+	if local.UdpPort > 0 {
+		ports.UdpPort = local.UdpPort
+	}
+	if local.RevPort > 0 {
+		ports.RevPort = local.RevPort
+	}
 	if ports.DirectPort == 0 {
 		ports.DirectPort = 28080
 	}

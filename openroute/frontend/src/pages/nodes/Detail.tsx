@@ -502,6 +502,22 @@ function OverviewTab({ node }: { node: Node }) {
 
   const memPercent = node.mem_total > 0 ? (node.mem_used / node.mem_total) * 100 : 0
   const diskPercent = node.disk_total > 0 ? (node.disk_used / node.disk_total) * 100 : 0
+  const network = node.reported_network ?? {}
+  const ports = ([
+    ['direct_port', 'connect_direct_port', 'direct', 28080],
+    ['ws_port', 'connect_ws_port', 'ws / http', 28081],
+    ['tls_port', 'connect_tls_port', 'tls', 28082],
+    ['udp_port', 'connect_udp_port', 'udp', 28083],
+    ['rev_port', 'connect_rev_port', 'reverse', 28084],
+  ] as const).map(([field, connectField, protocol, defaultPort]) => {
+    const local = network[field] || 0
+    const panel = node[field] || 0
+    const listener = local || panel || defaultPort
+    return { key: field, protocol, local, panel, listener,
+      advertised: network[connectField] || listener,
+      mapped: !!network[connectField],
+      source: t(local ? 'node.sourceClient' : panel ? 'node.sourcePanel' : 'node.sourceDefault') }
+  })
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -589,25 +605,31 @@ function OverviewTab({ node }: { node: Node }) {
         <Col xs={24} md={8}>
           <Card size="small" title={t('nodeDetail.ports')}>
             <Space size={6} wrap>
-              <Tag className="or-mono" style={{ margin: 0 }}>
-                direct {node.direct_port || 28080}
-              </Tag>
-              <Tag className="or-mono" style={{ margin: 0 }}>
-                ws {node.ws_port || 28081}
-              </Tag>
-              <Tag className="or-mono" style={{ margin: 0 }}>
-                tls {node.tls_port || 28082}
-              </Tag>
-              <Tag className="or-mono" style={{ margin: 0 }}>
-                udp {node.udp_port || 28083}
-              </Tag>
-              <Tag className="or-mono" style={{ margin: 0 }}>
-                rev {node.rev_port || 28084}
-              </Tag>
+              {ports.map((port) => (
+                <Tooltip key={port.key} title={port.source}>
+                  <Tag className="or-mono" style={{ margin: 0 }}>{port.protocol} {port.listener}</Tag>
+                </Tooltip>
+              ))}
             </Space>
           </Card>
         </Col>
       </Row>
+
+      <Card size="small" title={t('node.reportedNetwork')}>
+        <Typography.Paragraph>
+          <Text type="secondary">{t('node.reportedHost')}: </Text>
+          <Text code>{network.connect_host || t('node.inheritPanel')}</Text>
+        </Typography.Paragraph>
+        <Typography.Paragraph type="secondary">{t('node.addressPriority')}</Typography.Paragraph>
+        <Table size="small" pagination={false} dataSource={ports} scroll={{ x: 620 }} columns={[
+          { title: t('rule.protocol'), dataIndex: 'protocol' },
+          { title: t('node.clientListenerPort'), dataIndex: 'local', render: (value: number) => value || t('node.inheritPanel') },
+          { title: t('node.panelListenerPort'), dataIndex: 'panel', render: (value: number) => value || t('node.sourceDefault') },
+          { title: t('node.compiledListenerPort'), dataIndex: 'listener', render: (value: number, row) => <Space size={4}><Text code>{value}</Text><Text type="secondary">{row.source}</Text></Space> },
+          { title: t('node.advertisedPort'), dataIndex: 'advertised', render: (value: number, row) => <Space size={4}><Text code>{value}</Text>{row.mapped && <Tag>{t('node.portMapping')}</Tag>}</Space> },
+        ]} />
+        <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>{t('node.reportedNetworkHelp')}</Typography.Paragraph>
+      </Card>
 
       <Descriptions
         title={t('nodeDetail.systemInfo')}

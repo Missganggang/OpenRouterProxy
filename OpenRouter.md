@@ -974,37 +974,41 @@ base-url: "http://1.2.3.4:18888"
 token: "xxxxxxxxxxxx"
 # 是否为出口节点
 is-outbound: false
-# 是否启用 ECH
+# 预留 ECH 字段（当前客户端尚未实现）
 use-ech: false
 ech-query-name: ""
 
-# 本地监听端口（入口节点使用）
-direct-port: 0    # 入口直出（无隧道）监听端口段起点
-ws-port: 0        # ws / http 协议隧道监听端口段起点
-tls-port: 0       # tls 协议隧道监听端口段起点
-udp-port: 0       # 原生 UDP 监听端口段起点
-rev-port: 0       # 反向隧道监听端口段起点
+# 本机节点间隧道监听端口；0继承面板/默认值，不改变用户规则端口
+direct-port: 0    # direct 隧道 TCP 端口
+ws-port: 0        # ws / http 隧道 TCP 端口
+tls-port: 0       # tls 隧道 TCP 端口
+udp-port: 0       # 原生 UDP 隧道端口
+rev-port: 0       # 反向隧道 TCP 端口
 
-# 主动连接地址（出口节点使用）
-connect-host: ""            # 覆盖面板下发的连接地址
+# 发布本机供其它节点连接的地址和端口，支持NAT映射
+connect-host: ""            # 发布本机供其它节点连接的地址；组级static地址仍优先
 connect-direct-port: 0
 connect-ws-port: 0
 connect-tls-port: 0
 connect-udp-port: 0
 connect-rev-port: 0
 
-# 负载均衡权重（仅出口节点，默认 1）
+# 历史预留字段；当前实际权重由面板配置
 default-weight: 1
 ```
 
 **优先级规则（MUST 实现）**：命令行参数 `-u` / `-t` **完全覆盖** `config.yml` 中的 `base-url` / `token`。
 
-### 5.3 节点环境变量（`/opt/openroute/env.sh`）
+### 5.3 节点环境变量（默认 `/opt/openroute-node/env.sh`）
 
 | 变量 | 含义 | 版本要求 |
 |---|---|---|
 | `DISABLE_EXECUTE=1` | 禁用 WebSSH，并阻止远程升级 | |
-| `BIND_INBOUND` | 限定入口监听绑定的网卡/地址，多个用逗号分隔 | |
+| `BIND_INBOUND` | 用户规则监听的本机 IP 或网卡名，多个用逗号分隔 | |
+| `TUNNEL_BIND_INBOUND` | 节点间隧道监听的单个本机裸 IP；未填继承 BIND_INBOUND | nc20260922.2 |
+| `TUNNEL_BIND_OUTBOUND_4` / `_6` | 节点间隧道出站源 IP，与最终目标出站分开 | nc20260922.2 |
+| `TUNNEL_INTERFACE` | Linux 节点间隧道 socket 绑定网卡（SO_BINDTODEVICE） | nc20260922.2 |
+| `TUNNEL_FWMARK` | Linux 节点间隧道 socket 标记，路由规则需另配 | nc20260922.2 |
 | `BIND_OUTBOUND_4` | 限定出口 IPv4 出站源地址 | 不推荐使用 |
 | `BIND_OUTBOUND_6` | 限定出口 IPv6 出站源地址 | 不推荐使用 |
 | `OUTBOUND_FWMARK` | 出站流量打 fwmark，配合策略路由 | 新版本 |
@@ -1081,10 +1085,14 @@ journalctl -fu openroute-node
 /opt/openroute/rel_nodeclient -h
 
 # 手动指定连接地址与端口（调试）
-/opt/openroute/rel_nodeclient --connect-host 1.2.3.4 --ws-port 2333 --tls-port 2443
+/opt/openroute-node/rel_nodeclient -c /opt/openroute-node/config.yml --connect-host 10.88.0.2 --ws-port 28081 --tls-port 28082
 ```
 
 **面板内升级节点**：面板「节点管理」→ 选择节点 → 「升级」，节点拉取新版本二进制，替换后重启服务。若节点设置了 `DISABLE_EXECUTE=1`，升级被拒绝。
+
+本地监听与对外NAT端口分离、CLI/YAML/面板优先级以及IPLC/IEPL完整示例，见
+[`docs/PRIVATE_LINES.md`](openroute/docs/PRIVATE_LINES.md)。该指南描述实际客户端能力；
+本规格书中的其它预留配置不能自动视为已实现。
 
 ### 5.6 节点故障排查清单（写进 WebUI 帮助与 `docs/`）
 
@@ -2681,7 +2689,7 @@ node_ids                数组<int>（有序，含权重）
 
 ```
 DISABLE_EXECUTE=1        禁用 WebSSH 与远程升级
-BIND_INBOUND=eth0,eth1   限定入口绑定
+BIND_INBOUND=eth0,eth1   限定用户规则监听的网卡或IP，多个用逗号分隔
 BIND_OUTBOUND_4=1.2.3.4  限定出口 IPv4 源地址
 BIND_OUTBOUND_6=::1      限定出口 IPv6 源地址
 OUTBOUND_FWMARK=100      出站打 mark（配合策略路由）

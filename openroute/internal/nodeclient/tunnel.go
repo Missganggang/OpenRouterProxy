@@ -55,12 +55,20 @@ type tunnelServer struct {
 	certificate                atomic.Pointer[tls.Certificate]
 }
 
-func (e *Engine) configureGateways(cfg nodeproto.ConfigResponse) error {
-	addresses, err := bindAddresses(e.bind)
-	if err != nil {
-		return err
-	}
+func (e *Engine) configureGateways(cfg nodeproto.ConfigResponse, networkCfg networkConfig) error {
+	addresses := networkCfg.TunnelBind
+	var err error
 	wants := map[string]*tunnelServer{}
+	committed := false
+	defer func() {
+		if !committed {
+			for key, s := range wants {
+				if e.gateways[key] != s {
+					s.close()
+				}
+			}
+		}
+	}()
 	ports := map[string]int{"direct": cfg.Listeners.DirectPort, "ws": cfg.Listeners.WsPort, "tls": cfg.Listeners.TlsPort, "udp": cfg.Listeners.UdpPort, "reverse": cfg.Listeners.RevPort}
 	for _, r := range cfg.Rules {
 		if r.Enable && !r.UserLimits.Disabled && r.ReverseEnable && !r.IsOutbound && r.ReversePort > 0 {
@@ -93,34 +101,28 @@ func (e *Engine) configureGateways(cfg nodeproto.ConfigResponse) error {
 			if wants[key] != nil {
 				continue
 			}
-			fingerprint := key
+			fingerprint := key + fmt.Sprint(networkCfg.Tunnel)
 			if old := e.gateways[key]; old != nil && old.fingerprint == fingerprint {
 				wants[key] = old
 				continue
+			}
+			if e.gateways[key] != nil {
+				return errors.New("changing a tunnel socket routing policy requires restarting the node")
 			}
 			s := &tunnelServer{engine: e, kind: kind, address: address, fingerprint: fingerprint, conns: map[net.Conn]bool{}, nonces: map[string]int64{}, sessions: map[string]*udpTunnelSession{}}
 			if len(cert.Certificate) > 0 {
 				s.certificate.Store(&cert)
 			}
 			if kind == "udp" {
-				var addr *net.UDPAddr
-				addr, err = net.ResolveUDPAddr("udp", address)
-				if err == nil {
-					s.packet, err = net.ListenUDP("udp", addr)
-				}
+				s.packet, err = listenTunnelUDP(address, networkCfg.Tunnel)
 			} else {
-				s.listener, err = net.Listen("tcp", address)
+				s.listener, err = listenTunnelTCP(address, networkCfg.Tunnel)
 				if err == nil && kind == "tls" {
 					s.certificate.Store(&cert)
 					s.listener = tls.NewListener(s.listener, &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return s.certificate.Load(), nil }, MinVersion: tls.VersionTLS12})
 				}
 			}
 			if err != nil {
-				for key, added := range wants {
-					if e.gateways[key] != added {
-						added.close()
-					}
-				}
 				return fmt.Errorf("%s gateway: %w", kind, err)
 			}
 			wants[key] = s
@@ -144,6 +146,7 @@ func (e *Engine) configureGateways(cfg nodeproto.ConfigResponse) error {
 		}
 	}
 	e.gateways = wants
+	committed = true
 	return nil
 }
 func (s *tunnelServer) close() {
@@ -654,7 +657,7 @@ func (f *forwarder) dialPeerBase(peer nodeproto.GroupPeer, group uint64, network
 		dialCtx, cancel = context.WithTimeout(f.ctx, timeout)
 		defer cancel()
 	}
-	conn, err := outboundDial(dialCtx, "tcp", net.JoinHostPort(peer.Host, strconv.Itoa(port)))
+	conn, err := f.dialTunnelAddress(dialCtx, "tcp", net.JoinHostPort(peer.Host, strconv.Itoa(port)), timeout)
 	if err != nil {
 		return nil, err
 	}

@@ -84,11 +84,20 @@ func (r *Registry) RegisterHandler(c *gin.Context) {
 		"updated_at":      now,
 	}
 	applySystemInfo(updates, req.System)
+	networkChanged, err := applyNetworkInfo(node, req.Network, updates)
+	if err != nil {
+		fail(c, err)
+		return
+	}
 
 	if err := r.app.DB.WithContext(ctx).Model(&model.Node{}).Where("id = ?", node.ID).
 		Updates(updates).Error; err != nil {
 		fail(c, response.Wrap(response.CodeInternal, err, "更新节点注册信息失败"))
 		return
+	}
+
+	if networkChanged {
+		r.app.BumpConfigVersion("node_network_changed")
 	}
 
 	// 刷新内存中的节点副本，保证后续生成配置时拿到最新字段。
@@ -198,11 +207,20 @@ func (r *Registry) HeartbeatHandler(c *gin.Context) {
 	if req.Metrics.DiskTotal > 0 {
 		updates["disk_total"] = req.Metrics.DiskTotal
 	}
+	networkChanged, err := applyNetworkInfo(node, req.Network, updates)
+	if err != nil {
+		fail(c, err)
+		return
+	}
 
 	if err := r.app.DB.WithContext(ctx).Model(&model.Node{}).Where("id = ?", node.ID).
 		Updates(updates).Error; err != nil {
 		fail(c, response.Wrap(response.CodeInternal, err, "更新节点心跳失败"))
 		return
+	}
+
+	if networkChanged {
+		r.app.BumpConfigVersion("node_network_changed")
 	}
 
 	// 写入探针指标。失败不影响心跳（指标是旁路数据），仅记日志。

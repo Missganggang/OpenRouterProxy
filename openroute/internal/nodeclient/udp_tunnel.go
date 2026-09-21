@@ -118,7 +118,7 @@ func (f *forwarder) dialNativeUDP(peer nodeproto.GroupPeer, source string, path 
 	if peer.UdpPort <= 0 {
 		return nil, errors.New("peer native UDP port missing")
 	}
-	conn, err := outboundDial(f.ctx, "udp", net.JoinHostPort(peer.Host, strconv.Itoa(peer.UdpPort)))
+	conn, err := f.dialTunnelAddress(f.ctx, "udp", net.JoinHostPort(peer.Host, strconv.Itoa(peer.UdpPort)), 3*time.Second)
 	if err != nil {
 		return nil, err
 	}

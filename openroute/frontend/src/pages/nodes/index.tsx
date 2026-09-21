@@ -13,6 +13,7 @@ import {
   Alert,
   Button,
   Checkbox,
+  Col,
   Divider,
   Empty,
   Form,
@@ -22,6 +23,7 @@ import {
   Popconfirm,
   Popover,
   Progress,
+  Row,
   Select,
   Space,
   Table,
@@ -61,6 +63,14 @@ const { Text } = Typography
 
 /** 表格一次拉取的最大行数：节点数量是「几十台」量级，单页拉全更利于筛选与批量操作。 */
 const PAGE_SIZE = 100
+
+const LISTENER_PORTS = [
+  ['direct_port', 'direct', 28080],
+  ['ws_port', 'ws / http', 28081],
+  ['tls_port', 'tls', 28082],
+  ['udp_port', 'udp', 28083],
+  ['rev_port', 'reverse', 28084],
+] as const
 
 /** 可自定义显示的列。 */
 const ALL_COLUMNS = [
@@ -174,7 +184,7 @@ export default function NodesPage() {
   function openCreate() {
     setEditing(null)
     form.resetFields()
-    form.setFieldsValue({ role: 'both', weight: 1, max_conn: 0, group_ids: [] })
+    form.setFieldsValue({ role: 'both', weight: 1, max_conn: 0, group_ids: [], direct_port: 0, ws_port: 0, tls_port: 0, udp_port: 0, rev_port: 0 })
     setFormOpen(true)
   }
 
@@ -189,6 +199,11 @@ export default function NodesPage() {
       max_conn: node.max_conn,
       connect_host: node.connect_host,
       is_static: node.is_static,
+      direct_port: node.direct_port,
+      ws_port: node.ws_port,
+      tls_port: node.tls_port,
+      udp_port: node.udp_port,
+      rev_port: node.rev_port,
       remark: node.remark,
     })
     setFormOpen(true)
@@ -909,12 +924,32 @@ export default function NodesPage() {
               />
             </Form.Item>
           </Space>
-          <Form.Item name="connect_host" label={t('node.connectHost')}>
-            <Input placeholder={t('node.connectHost')} autoComplete="off" />
+          <Form.Item name="connect_host" label={t('node.connectHost')} extra={t('node.connectHostHelp')}>
+            <Input placeholder="10.0.0.2" autoComplete="off" />
           </Form.Item>
+          {editing?.reported_network?.connect_host && (
+            <Alert type="info" showIcon style={{ marginBottom: 12 }}
+              message={t('node.reportedHostValue', { host: editing.reported_network.connect_host })}
+              description={t('node.addressPriority')} />
+          )}
           <Form.Item name="is_static" label={t('node.isStatic')} valuePropName="checked">
             <Checkbox />
           </Form.Item>
+          <Divider orientation="left" plain>{t('node.listenerPorts')}</Divider>
+          <Typography.Paragraph type="secondary">{t('node.listenerPortsHelp')}</Typography.Paragraph>
+          <Row gutter={12}>
+            {LISTENER_PORTS.map(([field, protocol, defaultPort]) => (
+              <Col xs={12} sm={8} key={field}>
+                <Form.Item name={field} label={protocol}
+                  rules={[{ type: 'integer', min: 0, max: 65535, message: t('node.portRange') }]}
+                  extra={editing?.reported_network?.[field]
+                    ? t('node.clientPortOverride', { port: editing.reported_network[field]! })
+                    : t('node.defaultPort', { port: defaultPort })}>
+                  <InputNumber min={0} max={65535} precision={0} placeholder="0" style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            ))}
+          </Row>
           <Form.Item name="remark" label={t('common.remark')}>
             <Input.TextArea rows={2} maxLength={255} showCount />
           </Form.Item>

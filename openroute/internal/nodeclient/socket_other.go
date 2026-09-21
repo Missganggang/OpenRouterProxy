@@ -5,12 +5,15 @@ package nodeclient
 import (
 	"errors"
 	"net"
-	"os"
 )
 
-func configureSocketMark(d *net.Dialer) error {
-	if os.Getenv("OUTBOUND_FWMARK") != "" {
-		return errors.New("OUTBOUND_FWMARK is supported only on Linux")
+func validateSocketPolicy(p dialPolicy) error {
+	if p.Interface != "" {
+		return errors.New("TUNNEL_INTERFACE is supported only on Linux")
+	}
+	if p.MarkSet {
+		return errors.New("OUTBOUND_FWMARK and TUNNEL_FWMARK are supported only on Linux")
 	}
 	return nil
 }
+func configureSocketPolicy(d *net.Dialer, p dialPolicy) error { return validateSocketPolicy(p) }

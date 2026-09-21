@@ -2858,32 +2858,40 @@ paths:
               properties:
                 token: { type: string }
                 version: { type: string }
-                public_ipv4: { type: string }
-                public_ipv6: { type: string }
-                private_ip: { type: string }
-                os: { type: string }
-                arch: { type: string }
-                kernel_ver: { type: string }
-                cpu_model: { type: string }
-                cpu_cores: { type: integer }
-                mem_total: { type: integer, format: int64 }
-                disk_total: { type: integer, format: int64 }
-                boot_time: { type: string, format: date-time }
+                config_version: { type: integer, format: int64 }
+                uuid: { type: string }
+                disable_execute: { type: boolean }
+                network:
+                  $ref: '#/components/schemas/NodeNetworkConfig'
+                system:
+                  type: object
+                  properties:
+                    public_ipv4: { type: string }
+                    public_ipv6: { type: string }
+                    private_ip: { type: string }
+                    os: { type: string }
+                    arch: { type: string }
+                    kernel_ver: { type: string }
+                    cpu_model: { type: string }
+                    cpu_cores: { type: integer }
+                    mem_total: { type: integer, format: int64 }
+                    disk_total: { type: integer, format: int64 }
+                    boot_time: { type: integer, format: int64, description: Unix秒 }
       responses:
         '200':
-          description: 注册成功
+          description: 注册成功，节点协议直接返回JSON，不包裹v1的code/data外层
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: '#/components/schemas/ApiBody'
-                  - type: object
-                    properties:
-                      data:
-                        type: object
-                        properties:
-                          node_id: { type: integer, format: int64 }
-                          config: {}
+                type: object
+                properties:
+                  node_id: { type: integer, format: int64 }
+                  node_name: { type: string }
+                  role: { type: string }
+                  is_outbound: { type: boolean }
+                  heartbeat_interval: { type: integer }
+                  server_time: { type: integer, format: int64 }
+                  config: {}
 
   /api/node/heartbeat:
     post:
@@ -3352,7 +3360,12 @@ components:
         public_ipv4: { type: string }
         public_ipv6: { type: string }
         private_ip: { type: string }
-        connect_host: { type: string, description: 静态连接地址（出口用） }
+        connect_host: { type: string, description: 面板填写的默认节点连接地址；客户端非空connect-host优先，设备组静态地址优先于两者 }
+        reported_network:
+          allOf:
+            - $ref: '#/components/schemas/NodeNetworkConfig'
+          nullable: true
+          readOnly: true
         is_static: { type: boolean }
         direct_port: { type: integer }
         ws_port: { type: integer }
@@ -3409,6 +3422,11 @@ components:
         weight: { type: integer, default: 1 }
         max_conn: { type: integer, default: 0 }
         connect_host: { type: string }
+        direct_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        ws_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        tls_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        udp_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        rev_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
         is_static: { type: boolean }
         remark: { type: string }
 
@@ -4191,6 +4209,22 @@ components:
         with_secret: { type: boolean }
         created_at: { type: string, format: date-time }
 
+    NodeNetworkConfig:
+      type: object
+      description: 客户端本地网络覆盖；注册/心跳省略network时保留旧值，传空对象清除覆盖。0端口继承，connect端口只改变对端连接端口，不改变本机监听。详见docs/PRIVATE_LINES.md。
+      properties:
+        connect_host: { type: string, default: '', description: 发布本机可达的裸IP/域名，不可含协议头、端口或CIDR }
+        direct_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        ws_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        tls_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        udp_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        rev_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        connect_direct_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        connect_ws_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        connect_tls_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        connect_udp_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+        connect_rev_port: { type: integer, minimum: 0, maximum: 65535, default: 0 }
+
     HeartbeatRequest:
       type: object
       required: [node_id]
@@ -4198,6 +4232,8 @@ components:
         node_id: { type: integer, format: int64 }
         version: { type: string }
         config_version: { type: integer, format: int64 }
+        network:
+          $ref: '#/components/schemas/NodeNetworkConfig'
         metrics:
           $ref: '#/components/schemas/NodeMetrics'
         running_rules:

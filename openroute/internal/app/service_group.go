@@ -746,7 +746,7 @@ func (s *GroupService) nodeBriefs(ctx context.Context, ids []uint64) []DeviceGro
 		out = append(out, DeviceGroupNodeBrief{
 			ID: id, Name: n.Name, Role: n.Role, Online: n.Online,
 			Weight: n.Weight, MaxConn: n.MaxConn, CurrentConn: n.CurrentConn,
-			ConnectHost: n.ConnectHost, PublicIPv4: n.PublicIPv4, PublicIPv6: n.PublicIPv6,
+			ConnectHost: n.TunnelHost(), PublicIPv4: n.PublicIPv4, PublicIPv6: n.PublicIPv6,
 		})
 	}
 	return out

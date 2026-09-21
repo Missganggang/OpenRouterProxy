@@ -44,6 +44,7 @@ type forwarder struct {
 	rule                nodeproto.ConfigRule
 	views               []nodeproto.ConfigRule
 	cfg                 nodeproto.ConfigResponse
+	network             networkConfig
 	group               nodeproto.DeviceGroupConfig
 	inbound, outbound   bool
 	fingerprint         string
@@ -165,6 +166,10 @@ func (e *Engine) Apply(in nodeproto.ConfigResponse) []nodeproto.RuleSyncResult {
 		}
 		cfg = merged
 	}
+	networkCfg, networkErr := loadNetworkConfig(e.bind)
+	if networkErr != nil {
+		return failed(networkErr)
+	}
 	byID := map[uint64][]nodeproto.ConfigRule{}
 	for _, r := range cfg.Rules {
 		byID[r.RuleID] = append(byID[r.RuleID], r)
@@ -218,7 +223,7 @@ func (e *Engine) Apply(in nodeproto.ConfigResponse) []nodeproto.RuleSyncResult {
 		if !r.Enable || r.UserLimits.Disabled {
 			continue
 		}
-		fingerprint := nodeproto.RuleConfigHash(cfg, r) + fmt.Sprint(inbound, outbound)
+		fingerprint := nodeproto.RuleConfigHash(cfg, r) + fmt.Sprint(inbound, outbound, networkCfg)
 		old := e.rules[id]
 		if old != nil && old.fingerprint == fingerprint {
 			candidates[id] = old
@@ -226,6 +231,7 @@ func (e *Engine) Apply(in nodeproto.ConfigResponse) []nodeproto.RuleSyncResult {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		f := &forwarder{engine: e, rule: r, views: views, cfg: cfg, group: cfg.DeviceGroupConfig[strconv.FormatUint(r.InboundGroupID, 10)], inbound: inbound, outbound: outbound, fingerprint: fingerprint, ctx: ctx, cancel: cancel, connections: map[net.Conn]struct{}{}, usage: newUsage(), health: map[string]*healthState{}, peerActive: map[uint64]int{}}
+		f.network = networkCfg
 		f.traffic = e.counter(id, "inbound")
 		f.outTraffic = e.counter(id, "outbound")
 		if r.UserID > 0 {
@@ -250,7 +256,7 @@ func (e *Engine) Apply(in nodeproto.ConfigResponse) []nodeproto.RuleSyncResult {
 		}
 		candidates[id] = f
 	}
-	if err := e.configureGateways(cfg); err != nil {
+	if err := e.configureGateways(cfg, networkCfg); err != nil {
 		return rollback(err)
 	}
 	for id, old := range e.rules {
@@ -378,29 +384,37 @@ func (e *Engine) closeReverse() {
 }
 func bindAddresses(bind string) ([]string, error) {
 	var out []string
+	seen := map[string]bool{}
+	add := func(ip net.IP) {
+		address := ip.String()
+		if !seen[address] {
+			seen[address] = true
+			out = append(out, address)
+		}
+	}
 	for _, part := range strings.Split(bind, ",") {
 		part = strings.TrimSpace(part)
-		if net.ParseIP(part) != nil {
-			out = append(out, part)
+		if ip := net.ParseIP(part); ip != nil {
+			add(ip)
 			continue
 		}
 		iface, err := net.InterfaceByName(part)
 		if err != nil {
-			return nil, fmt.Errorf("invalid bind address/interface %q", part)
+			return nil, fmt.Errorf("BIND_INBOUND: invalid bind address/interface %q", part)
 		}
 		addresses, err := iface.Addrs()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("BIND_INBOUND: %w", err)
 		}
-		for _, addr := range addresses {
-			ip, _, err := net.ParseCIDR(addr.String())
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
 			if err == nil {
-				out = append(out, ip.String())
+				add(ip)
 			}
 		}
 	}
 	if len(out) == 0 {
-		return nil, errors.New("no usable bind addresses")
+		return nil, errors.New("BIND_INBOUND: no usable bind addresses")
 	}
 	return out, nil
 }
@@ -520,10 +534,7 @@ func (f *forwarder) startListeners() error {
 	if !f.inbound || f.rule.IsSubRule {
 		return nil
 	}
-	addresses, err := bindAddresses(f.engine.bind)
-	if err != nil {
-		return err
-	}
+	addresses := f.network.RuleBind
 	previousPorts := append([]int(nil), f.ports...)
 	f.ports = nil
 	end := max(f.rule.ListenPortEnd, f.rule.ListenPort)
@@ -653,7 +664,7 @@ func (f *forwarder) dialTarget(network, source string) (net.Conn, *forwardTarget
 		if containsShape(f.rule.Shaping, 2000) && strings.Contains(target.address, "]:") {
 			continue
 		}
-		conn, err := outboundDial(f.ctx, network, target.address)
+		conn, err := f.dialTargetAddress(f.ctx, network, target.address, 5*time.Second)
 		if err != nil {
 			f.markHealth(target.address, false, 0)
 			last = err
@@ -901,28 +912,4 @@ func (f *forwarder) serveUDP(listener *net.UDPConn) {
 			conn.Close()
 		}
 	}
-}
-func outboundDial(ctx context.Context, network, address string) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	host, _, _ := net.SplitHostPort(address)
-	ip := net.ParseIP(host)
-	source := os.Getenv("BIND_OUTBOUND_4")
-	if ip != nil && ip.To4() == nil {
-		source = os.Getenv("BIND_OUTBOUND_6")
-	}
-	if source != "" {
-		local := net.ParseIP(source)
-		if local == nil {
-			return nil, errors.New("invalid outbound bind IP")
-		}
-		if strings.HasPrefix(network, "udp") {
-			dialer.LocalAddr = &net.UDPAddr{IP: local}
-		} else {
-			dialer.LocalAddr = &net.TCPAddr{IP: local}
-		}
-	}
-	if err := configureSocketMark(&dialer); err != nil {
-		return nil, err
-	}
-	return dialer.DialContext(ctx, network, address)
 }

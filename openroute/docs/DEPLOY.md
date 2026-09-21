@@ -207,10 +207,16 @@ S=openroute           # 服务名（默认 openroute），多实例部署时用�
 OPTIMIZE=1            # 启用内核网络参数优化（BBR、缓冲区、文件句柄）
 INSTALL_TOOLS=1       # 安装常用排查工具（iftop、mtr、tcpdump 等）
 DISABLE_EXECUTE=1     # 禁用 WebSSH 与远程升级
-BIND_INBOUND=eth0     # 限定入口监听绑定的网卡/地址，多个用逗号分隔
+BIND_INBOUND=0.0.0.0  # 用户规则监听IP；也支持网卡名及逗号分隔的列表
+TUNNEL_BIND_INBOUND=10.88.0.1 # 本机隧道监听IP，与用户规则监听分开
+TUNNEL_BIND_OUTBOUND_4=10.88.0.1 # 本机建立IPv4隧道的源IP
+TUNNEL_INTERFACE=eth1 # Linux上约束隧道使用的网卡，仍需系统路由
 COUNT_INTERFACE=eth0  # 指定探针统计流量的网卡
 UUID=<唯一值>          # 同一台机器跑多个实例时为每个实例指定唯一值
 ```
+
+专线参数、继承规则、现有安装的 env.sh 保留行为，以及双机 / NAT / 反向完整示例见
+[专线配置指南](PRIVATE_LINES.md)。`--connect-host` 发布本机可达地址，不是填写对端地址。
 
 示例（优化内核 + 指定统计网卡）：
 

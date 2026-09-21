@@ -74,6 +74,21 @@ export interface UserGroup {
 /** 节点角色。 */
 export type NodeRole = 'inbound' | 'outbound' | 'both'
 
+/** 客户端最近上报的本地配置；空地址、零端口表示不覆盖面板配置。 */
+export interface NodeNetworkConfig {
+  connect_host?: string
+  direct_port?: number
+  ws_port?: number
+  tls_port?: number
+  udp_port?: number
+  rev_port?: number
+  connect_direct_port?: number
+  connect_ws_port?: number
+  connect_tls_port?: number
+  connect_udp_port?: number
+  connect_rev_port?: number
+}
+
 /** 节点（规格书 4.2.3）。 */
 export interface Node {
   id: number
@@ -84,6 +99,7 @@ export interface Node {
   public_ipv6: string
   private_ip: string
   connect_host: string
+  reported_network?: NodeNetworkConfig | null
   is_static: boolean
   direct_port: number
   ws_port: number

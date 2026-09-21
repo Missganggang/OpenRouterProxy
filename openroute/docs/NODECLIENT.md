@@ -3,6 +3,9 @@
 仓库的 `cmd/nodeclient` 是与本面板 HTTP 协议配套的节点程序。
 面板程序本身以及其它项目的节点二进制都不能代替它。
 
+内网、IPLC / IEPL、多网卡、`--connect-host`、本地 / NAT 端口参数及完整示例见
+[专线配置指南](PRIVATE_LINES.md)。`nc20260922.2` 起这些本地网络参数已接通注册、心跳及对端配置下发。
+
 ## 构建和下载
 
 在仓库根目录运行 `./deploy/build.ps1`（PowerShell），构建面板与 Linux
@@ -24,18 +27,19 @@ Linux 下也可直接构建：
 cd openroute
 mkdir -p node-binaries/amd64
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
-  go build -trimpath -ldflags '-X main.version=nc20260922' \
+  go build -trimpath -ldflags '-X main.version=nc20260922.2' \
   -o node-binaries/amd64/rel_nodeclient ./cmd/nodeclient
-printf '%s' nc20260922 > node-binaries/amd64/version.txt
+printf '%s' nc20260922.2 > node-binaries/amd64/version.txt
 ```
 
 ## 安装与运行
 
 安装脚本面向 Debian 11+、Ubuntu 22.04+，需要 root 权限和 systemd。
-**本次更新后，所有参与转发的入口、出口、链式中继和反向节点都需要由使用者
-在对应服务器重新执行一次面板生成的安装命令。旧客户端不支持远程升级任务，
-不能只点击升级完成此次迁移。** 先更新面板和下载文件，再重装节点；更新面板
-不会自动替换远端正在运行的节点程序。
+所有参与新功能的入口、出口、链式中继和反向节点都需要更新至 `nc20260922.2`。
+`nc20260922.1` 已支持面板远程升级；更早且尚未实现升级任务的客户端，需要在对应
+服务器重新执行面板生成的安装命令。要同时持久化新的网络参数，也可以直接重跑
+安装命令并追加参数。先更新面板和下载文件，再更新节点；更新面板不会自动替换
+远端正在运行的节点程序。设置 `DISABLE_EXECUTE=1` 的节点需本机手动更新。
 
 在面板创建节点后，复制该节点的安装命令到目标服务器执行。
 公开 `/install.sh` 只包含通用脚本，不会查询或内嵌现有节点密钥。
