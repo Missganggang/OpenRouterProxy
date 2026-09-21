@@ -1,0 +1,38 @@
+﻿# ── 构建产物（体积大，不入库）──────────────────────────────
+openroute/openroute
+openroute/openroute.exe
+openroute/openroute-linux-*.exe
+openroute/public/
+deploy/openroute
+deploy/openroute-deploy.tar.gz
+sshexec/sshexec
+sshexec/sshexec.exe
+
+# ── 依赖与缓存 ─────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+*.tsbuildinfo
+
+# ── 运行时数据与凭据（绝不能入库）──────────────────────────
+data.db
+data.db-wal
+data.db-shm
+data.db.before-restore
+config.yml
+logs/
+backups/
+nyanpass-sample.db
+/etc/openroute.env
+
+# ── 测试与调试残留 ─────────────────────────────────────────
+*.test
+*.out
+startup.log
+startup.err
+/tmp/
+
+# ── 编辑器与系统 ───────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

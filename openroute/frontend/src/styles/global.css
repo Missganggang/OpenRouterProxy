@@ -1,0 +1,313 @@
+/**
+ * 全局样式。
+ *
+ * 只做「无法用组件级样式表达」的事情：
+ * 重置、布局骨架、滚动条、终端容器、通用工具类。
+ * 组件样式一律写在组件内，避免全局污染。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial,
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.5715;
+  color: var(--or-text-primary);
+  background: var(--or-bg-layout);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--or-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--or-primary-hover);
+}
+
+/* ── 滚动条 ───────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── 布局骨架 ─────────────────────────────────────────── */
+.or-layout {
+  min-height: 100vh;
+}
+
+.or-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--or-header-height);
+  padding: 0 16px 0 0;
+  background: var(--or-bg-header);
+  border-bottom: 1px solid var(--or-border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.or-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--or-header-height);
+  padding: 0 16px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--or-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.or-logo img {
+  height: 26px;
+  width: auto;
+}
+
+.or-content {
+  padding: 16px;
+  min-height: calc(100vh - var(--or-header-height));
+}
+
+.or-sider {
+  background: var(--or-bg-sider);
+  border-right: 1px solid var(--or-border);
+}
+
+/* ── 页面通用 ─────────────────────────────────────────── */
+.or-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.or-page-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--or-text-primary);
+}
+
+.or-page-desc {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--or-text-tertiary);
+}
+
+.or-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+/* 表格中的紧凑操作按钮组 */
+.or-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+/* 等宽字体场景：端口号、IP、Token */
+.or-mono {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+  font-size: 13px;
+}
+
+/* Token / 密钥的展示：允许换行但不撑破布局 */
+.or-secret {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  background: var(--or-bg-hover);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* ── 状态点（节点在线 / 离线）──────────────────────────── */
+.or-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.or-dot-online {
+  background: var(--or-success);
+  box-shadow: 0 0 0 3px var(--or-success-bg);
+}
+
+.or-dot-offline {
+  background: var(--or-text-disabled);
+  box-shadow: 0 0 0 3px var(--or-divider);
+}
+
+.or-dot-warning {
+  background: var(--or-warning);
+  box-shadow: 0 0 0 3px var(--or-warning-bg);
+}
+
+.or-dot-error {
+  background: var(--or-error);
+  box-shadow: 0 0 0 3px var(--or-error-bg);
+}
+
+/* ── 终端（WebSSH）────────────────────────────────────── */
+.or-terminal-wrap {
+  background: #1e1e1e;
+  border-radius: var(--or-radius);
+  padding: 8px;
+  height: 520px;
+  overflow: hidden;
+}
+
+.or-terminal {
+  height: 100%;
+  width: 100%;
+}
+
+/* xterm 需要显式尺寸，否则不会渲染 */
+.or-terminal .xterm {
+  height: 100%;
+}
+
+/* ── 差异对比（快照 / 漂移）────────────────────────────── */
+.or-diff {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  max-height: 520px;
+  overflow: auto;
+  background: var(--or-bg-hover);
+  border-radius: var(--or-radius);
+  padding: 12px;
+}
+
+.or-diff-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.or-diff-add {
+  background: var(--or-success-bg);
+  color: #0f7b26;
+}
+
+.or-diff-del {
+  background: var(--or-error-bg);
+  color: #c62828;
+}
+
+/* ── 迁移预检报告（等宽框线文本）───────────────────────── */
+.or-report {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre;
+  overflow-x: auto;
+  background: #1f2329;
+  color: #d7dbe0;
+  border-radius: var(--or-radius);
+  padding: 16px;
+}
+
+/* ── 空状态引导 ───────────────────────────────────────── */
+.or-empty {
+  padding: 48px 0;
+  text-align: center;
+}
+
+/* ── 节点状态格子（仪表盘 / 监控页）────────────────────── */
+.or-node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.or-node-card {
+  border: 1px solid var(--or-border);
+  border-radius: var(--or-radius);
+  padding: 12px;
+  background: var(--or-bg-container);
+  transition: box-shadow 0.2s, transform 0.2s;
+  cursor: pointer;
+}
+
+.or-node-card:hover {
+  box-shadow: var(--or-shadow-lg);
+  transform: translateY(-1px);
+}
+
+.or-node-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.or-node-card-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--or-text-secondary);
+}
+
+.or-node-card-metrics b {
+  color: var(--or-text-primary);
+  font-weight: 500;
+}
+
+/* ── 响应式：< 1280px 时折叠侧边栏（规格书 9.3）────────── */
+@media (max-width: 1280px) {
+  .or-content {
+    padding: 12px;
+  }
+}
+
+/* 打印时隐藏操作按钮 */
+@media print {
+  .or-toolbar,
+  .or-actions {
+    display: none;
+  }
+}

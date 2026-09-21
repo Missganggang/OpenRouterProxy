@@ -1,0 +1,28 @@
+# ── 构建产物 ───────────────────────────────────────────────
+/openroute
+/openroute.exe
+/public/
+frontend/node_modules/
+frontend/dist/
+
+# ── 运行时数据（个人自用部署产生的文件，不应入库）─────────
+/data.db
+/data.db-wal
+/data.db-shm
+/data.db.before-restore
+/config.yml
+/logs/
+/backups/
+/nyanpass-sample.db
+
+# ── 测试与调试残留 ────────────────────────────────────────
+*.test
+/startup.log
+/startup.err
+*.out
+
+# ── 编辑器与系统 ──────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

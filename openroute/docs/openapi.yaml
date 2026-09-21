@@ -1,0 +1,4265 @@
+openapi: 3.1.0
+info:
+  title: OpenRoute 面板 API
+  version: 1.0.0
+  description: |
+    OpenRoute 是一个自研、可私有化的 TCP/UDP 转发管理面板。
+
+    ## 认证
+    支持四种方式：Session Cookie、JWT Bearer、API Token（`X-API-Key`）、
+    节点 Token（`X-Node-Token`）。详见 `docs/API.md`。
+
+    ## 统一响应体
+    所有接口返回同一个外层结构，`code` 为 0 表示成功，
+    非 0 时 `message` 为中文错误信息，`details` 携带字段级定位信息。
+
+    ## 版本化
+    管理接口全部位于 `/api/v1/`；节点通信接口位于 `/api/node/`（不带版本号）。
+  license:
+    name: 个人自用项目
+servers:
+  - url: http://127.0.0.1:18888
+    description: 默认监听地址（可在 config.yml 中修改）
+
+tags:
+  - name: auth
+    description: 认证与令牌
+  - name: node
+    description: 节点管理与监控
+  - name: node-group
+    description: 节点分组
+  - name: device-group
+    description: 设备组（入口组 / 出口组）
+  - name: rule
+    description: 转发规则
+  - name: rule-group
+    description: 规则分组
+  - name: user
+    description: 用户与用户分组
+  - name: traffic
+    description: 流量统计
+  - name: probe
+    description: 探针与监控
+  - name: system
+    description: 系统、设置、审计、任务
+  - name: alert
+    description: 告警
+  - name: snapshot
+    description: 配置快照
+  - name: migration
+    description: 迁移与备份
+  - name: node-agent
+    description: 节点通信（不带 /v1）
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+  - cookieAuth: []
+
+paths:
+  # ───────────────────────── 认证 ─────────────────────────
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: 登录
+      description: |
+        校验用户名密码并签发访问令牌与刷新令牌。
+        连续失败 3 次后要求图形验证码；10 次失败锁定 15 分钟。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: admin
+                password:
+                  type: string
+                  format: password
+                captcha:
+                  type: string
+                  description: 图形验证码（连续失败 3 次后必填）
+                captcha_id:
+                  type: string
+                  description: 验证码标识，取自 /auth/captcha
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LoginResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: 登出
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: 刷新访问令牌
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LoginResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前登录用户信息与权限
+      responses:
+        '200':
+          description: 用户信息
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/password:
+    post:
+      tags: [auth]
+      summary: 修改自己的密码
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password:
+                  type: string
+                  format: password
+                new_password:
+                  type: string
+                  format: password
+                  minLength: 6
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/captcha:
+    get:
+      tags: [auth]
+      summary: 获取图形验证码
+      description: 返回验证码标识与可直接内联到 img/div 的 SVG 数据。
+      security: []
+      responses:
+        '200':
+          description: 验证码
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          captcha_id:
+                            type: string
+                          svg:
+                            type: string
+
+  # ───────────────────────── 节点 ─────────────────────────
+  /api/v1/nodes:
+    get:
+      tags: [node]
+      summary: 节点列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Order'
+        - name: group_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: online
+          in: query
+          schema: { type: boolean }
+        - name: keyword
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: 节点列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/Node'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [node]
+      summary: 创建节点
+      description: 返回一次性 token 与可直接执行的安装命令（一键对接）。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeCreateInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/NodeCreateResult'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/nodes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [node]
+      summary: 节点详情
+      responses:
+        '200':
+          description: 节点
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Node'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [node]
+      summary: 更新节点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeUpdateInput'
+      responses:
+        '200':
+          description: 更新后的节点
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Node'
+    delete:
+      tags: [node]
+      summary: 删除节点
+      description: 删除后该节点上的规则会被标记为「节点已删除」并进入待处理清单。
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/nodes/{id}/install-command:
+    post:
+      tags: [node]
+      summary: 生成安装命令
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 安装命令与 token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token: { type: string }
+                          install_command: { type: string }
+
+  /api/v1/nodes/{id}/upgrade:
+    post:
+      tags: [node]
+      summary: 升级节点客户端
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '502':
+          $ref: '#/components/responses/NodeError'
+
+  /api/v1/nodes/{id}/restart:
+    post:
+      tags: [node]
+      summary: 重启节点服务
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '502':
+          $ref: '#/components/responses/NodeError'
+
+  /api/v1/nodes/{id}/exec:
+    post:
+      tags: [node]
+      summary: 在节点执行命令
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command: { type: string }
+      responses:
+        '200':
+          description: 任务已下发
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          task_id: { type: integer, format: int64 }
+        '403':
+          description: 节点设置了 DISABLE_EXECUTE=1，拒绝执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBody'
+
+  /api/v1/nodes/{id}/reset-token:
+    post:
+      tags: [node]
+      summary: 重置节点密钥
+      description: 重置后节点需要重新安装才能重新上线。
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 新 token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token: { type: string }
+
+  /api/v1/nodes/{id}/metrics:
+    get:
+      tags: [node]
+      summary: 节点探针数据
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          description: 聚合粒度；留空则按时间范围自动降采样
+          schema:
+            type: string
+            enum: [1h, 1d, 7d]
+      responses:
+        '200':
+          description: 指标序列
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ProbeMetric'
+
+  /api/v1/nodes/{id}/metrics/realtime:
+    get:
+      tags: [node]
+      summary: 节点实时指标
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 最近一次采样
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProbeMetric'
+
+  /api/v1/nodes/{id}/rules:
+    get:
+      tags: [node]
+      summary: 该节点上运行的规则
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 规则列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ForwardRule'
+
+  /api/v1/nodes/{id}/logs:
+    get:
+      tags: [node]
+      summary: 节点日志
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+        - name: lines
+          in: query
+          schema: { type: integer, default: 200, maximum: 2000 }
+      responses:
+        '200':
+          description: 日志行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          lines:
+                            type: array
+                            items: { type: string }
+
+  /api/v1/nodes/{id}/drift:
+    get:
+      tags: [node]
+      summary: 配置漂移详情
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 漂移详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          drifted: { type: boolean }
+                          details: {}
+
+  /api/v1/nodes/{id}/drift/fix:
+    post:
+      tags: [node]
+      summary: 一键纠正配置漂移
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/nodes/batch/upgrade:
+    post:
+      tags: [node]
+      summary: 批量升级节点
+      requestBody:
+        $ref: '#/components/requestBodies/BatchIDs'
+      responses:
+        '200':
+          $ref: '#/components/responses/BatchResult'
+
+  /api/v1/nodes/batch/exec:
+    post:
+      tags: [node]
+      summary: 批量在节点执行命令
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, command]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                command: { type: string }
+      responses:
+        '200':
+          $ref: '#/components/responses/BatchResult'
+
+  /api/v1/nodes/batch/group:
+    post:
+      tags: [node]
+      summary: 批量改分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, group_ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                group_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+      responses:
+        '200':
+          $ref: '#/components/responses/BatchResult'
+
+  /api/v1/nodes/batch/weight:
+    post:
+      tags: [node]
+      summary: 批量改权重
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, weight]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                weight:
+                  type: integer
+                  minimum: 1
+      responses:
+        '200':
+          $ref: '#/components/responses/BatchResult'
+
+  # ───────────────────────── 节点分组 ─────────────────────────
+  /api/v1/node-groups:
+    get:
+      tags: [node-group]
+      summary: 节点分组列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/NodeGroup'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [node-group]
+      summary: 创建节点分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeGroupInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/NodeGroup'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/node-groups/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [node-group]
+      summary: 节点分组详情
+      responses:
+        '200':
+          description: 分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/NodeGroup'
+    put:
+      tags: [node-group]
+      summary: 更新节点分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeGroupInput'
+      responses:
+        '200':
+          description: 更新后的分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/NodeGroup'
+    delete:
+      tags: [node-group]
+      summary: 删除节点分组
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/node-groups/{id}/nodes:
+    get:
+      tags: [node-group]
+      summary: 分组内的节点
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 节点列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Node'
+
+  /api/v1/node-groups/{id}/export:
+    get:
+      tags: [node-group]
+      summary: 导出分组内节点为 CSV
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: CSV 文件
+          content:
+            text/csv:
+              schema:
+                type: string
+
+  # ───────────────────────── 设备组 ─────────────────────────
+  /api/v1/device-groups:
+    get:
+      tags: [device-group]
+      summary: 设备组列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [inbound, outbound]
+        - $ref: '#/components/parameters/Keyword'
+      responses:
+        '200':
+          description: 设备组列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/DeviceGroup'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [device-group]
+      summary: 创建设备组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceGroupInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DeviceGroup'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /api/v1/device-groups/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [device-group]
+      summary: 设备组详情（含解析后的 Config）
+      responses:
+        '200':
+          description: 设备组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DeviceGroup'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [device-group]
+      summary: 更新设备组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceGroupInput'
+      responses:
+        '200':
+          description: 更新后的设备组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DeviceGroup'
+    delete:
+      tags: [device-group]
+      summary: 删除设备组
+      description: 被规则引用时返回 40903。
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '409':
+          description: 该设备组正在被规则引用，无法删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBody'
+
+  /api/v1/device-groups/{id}/schema:
+    get:
+      tags: [device-group]
+      summary: 该类型组的配置字段 schema
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: schema
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DeviceGroupSchema'
+
+  /api/v1/device-groups-schema:
+    get:
+      tags: [device-group]
+      summary: 按类型取配置字段 schema
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [inbound, outbound]
+      responses:
+        '200':
+          description: schema
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DeviceGroupSchema'
+
+  /api/v1/device-groups/{id}/validate:
+    post:
+      tags: [device-group]
+      summary: 校验配置合法性（含故障转移组兼容性）
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config:
+                  type: object
+      responses:
+        '200':
+          description: 校验结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          valid: { type: boolean }
+                          errors:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                field: { type: string }
+                                message: { type: string }
+                          warnings:
+                            type: array
+                            items: { type: string }
+
+  /api/v1/device-groups/{id}/health:
+    get:
+      tags: [device-group]
+      summary: 组内节点健康状态与负载分布
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 健康状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/GroupHealth'
+
+  /api/v1/device-groups/{id}/reorder:
+    post:
+      tags: [device-group]
+      summary: 调整组内节点顺序（顺序参与负载均衡决策）
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_ids]
+              properties:
+                node_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  # ───────────────────────── 转发规则 ─────────────────────────
+  /api/v1/forward-rules:
+    get:
+      tags: [rule]
+      summary: 转发规则列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/Keyword'
+        - name: user_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: rule_group_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: inbound_group_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: outbound_group_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: sync_status
+          in: query
+          schema:
+            type: string
+            enum: [unsynced, syncing, normal, failed]
+        - name: enable
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: 规则列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ForwardRule'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [rule]
+      summary: 创建转发规则
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForwardRuleInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ForwardRule'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /api/v1/forward-rules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [rule]
+      summary: 规则详情
+      responses:
+        '200':
+          description: 规则
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ForwardRule'
+    put:
+      tags: [rule]
+      summary: 更新规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForwardRuleInput'
+      responses:
+        '200':
+          description: 更新后的规则
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ForwardRule'
+    delete:
+      tags: [rule]
+      summary: 删除规则
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/forward-rules/{id}/enable:
+    post:
+      tags: [rule]
+      summary: 启用规则
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/forward-rules/{id}/disable:
+    post:
+      tags: [rule]
+      summary: 禁用规则
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/forward-rules/{id}/resync:
+    post:
+      tags: [rule]
+      summary: 强制重新下发
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/forward-rules/{id}/traffic:
+    get:
+      tags: [rule]
+      summary: 规则的流量时间序列
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day]
+      responses:
+        '200':
+          description: 时间序列
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          points:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/TrafficPoint'
+
+  /api/v1/forward-rules/{id}/sessions:
+    get:
+      tags: [rule]
+      summary: 当前会话列表
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Session'
+
+  /api/v1/forward-rules/batch:
+    post:
+      tags: [rule]
+      summary: 批量操作
+      description: |
+        `action` 可选值：`enable`、`disable`、`delete`、`set_rule_group`、
+        `set_multiplier`、`scale_multiplier`、`set_outbound_group`、
+        `set_limits`、`set_chain`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchActionRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/BatchResult'
+
+  /api/v1/forward-rules/batch-multiplier:
+    post:
+      tags: [rule]
+      summary: 批量调整倍率（按比例）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, scale]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                scale:
+                  type: number
+                  format: float
+                  description: 缩放比例，如 1.5 表示全部 ×1.5
+                  example: 1.5
+      responses:
+        '200':
+          description: 更新条数
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          updated: { type: integer }
+
+  /api/v1/forward-rules/import:
+    post:
+      tags: [rule]
+      summary: 导入规则
+      description: |
+        同时支持旧版文本格式与新版 JSON 格式。
+
+        文本格式：`规则名#监听端口#目标地址#目标端口`，
+        双井号表示随机端口，端口可用 `8443-8450` 表示端口段。
+
+        先以 `?preview=true` 调用获得预览，确认后再以 `preview=false` 落库。
+      parameters:
+        - name: preview
+          in: query
+          schema: { type: boolean, default: true }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '200':
+          description: 预览结果或导入结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        oneOf:
+                          - $ref: '#/components/schemas/ImportPreview'
+                          - type: object
+                            properties:
+                              created: { type: integer }
+                              skipped: { type: integer }
+
+  /api/v1/forward-rules/export:
+    get:
+      tags: [rule]
+      summary: 导出规则为 JSON
+      parameters:
+        - name: user_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: rule_group_id
+          in: query
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 导出的规则
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          rules:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ForwardRule'
+
+  # ───────────────────────── 规则分组 ─────────────────────────
+  /api/v1/rule-groups:
+    get:
+      tags: [rule-group]
+      summary: 规则分组列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/RuleGroup'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [rule-group]
+      summary: 创建规则分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleGroupInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RuleGroup'
+
+  /api/v1/rule-groups/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [rule-group]
+      summary: 规则分组详情
+      responses:
+        '200':
+          description: 分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RuleGroup'
+    put:
+      tags: [rule-group]
+      summary: 更新规则分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleGroupInput'
+      responses:
+        '200':
+          description: 更新后的分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RuleGroup'
+    delete:
+      tags: [rule-group]
+      summary: 删除规则分组
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/rule-groups/reorder:
+    post:
+      tags: [rule-group]
+      summary: 调整规则分组顺序
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  # ───────────────────────── 用户 ─────────────────────────
+  /api/v1/users:
+    get:
+      tags: [user]
+      summary: 用户列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: group_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: role
+          in: query
+          schema:
+            type: string
+            enum: [admin, user]
+      responses:
+        '200':
+          description: 用户列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/User'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [user]
+      summary: 创建用户（管理员手工建号）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [user]
+      summary: 用户详情
+      responses:
+        '200':
+          description: 用户
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+    put:
+      tags: [user]
+      summary: 更新用户
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserInput'
+      responses:
+        '200':
+          description: 更新后的用户
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+    delete:
+      tags: [user]
+      summary: 删除用户
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/users/{id}/reset-password:
+    post:
+      tags: [user]
+      summary: 重置用户密码
+      description: 返回一次性明文随机密码，仅在本次响应中可见。
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 新密码
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          password: { type: string }
+
+  /api/v1/users/{id}/reset-token:
+    post:
+      tags: [user]
+      summary: 重置订阅 Token
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 新 Token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          token: { type: string }
+
+  /api/v1/users/{id}/disable:
+    post:
+      tags: [user]
+      summary: 禁用用户
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/users/{id}/traffic:
+    get:
+      tags: [user]
+      summary: 用户的流量统计
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day]
+      responses:
+        '200':
+          description: 时间序列
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          points:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/TrafficPoint'
+
+  /api/v1/users/{id}/rules:
+    get:
+      tags: [user]
+      summary: 用户拥有的规则
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 规则列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ForwardRule'
+
+  /api/v1/user-groups:
+    get:
+      tags: [user]
+      summary: 用户分组列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/UserGroup'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [user]
+      summary: 创建用户分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserGroupInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserGroup'
+
+  /api/v1/user-groups/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [user]
+      summary: 用户分组详情
+      responses:
+        '200':
+          description: 分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserGroup'
+    put:
+      tags: [user]
+      summary: 更新用户分组
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserGroupInput'
+      responses:
+        '200':
+          description: 更新后的分组
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserGroup'
+    delete:
+      tags: [user]
+      summary: 删除用户分组
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/sub/{token}:
+    get:
+      tags: [user]
+      summary: 用户订阅（无需认证）
+      description: 按用户的订阅 Token 返回该用户可用规则的配置文本。
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 配置文本
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ───────────────────────── 流量 ─────────────────────────
+  /api/v1/traffic/overview:
+    get:
+      tags: [traffic]
+      summary: 全站流量概览
+      responses:
+        '200':
+          description: 概览
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/TrafficOverview'
+
+  /api/v1/traffic/timeseries:
+    get:
+      tags: [traffic]
+      summary: 流量时间序列
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day]
+        - name: group_by
+          in: query
+          schema:
+            type: string
+            enum: [user, rule, node, direction, none]
+        - name: user_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: rule_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: node_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [in, out]
+      responses:
+        '200':
+          description: 时间序列
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          points:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/TrafficPoint'
+
+  /api/v1/traffic/top:
+    get:
+      tags: [traffic]
+      summary: Top-N 排行
+      parameters:
+        - name: dimension
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [user, rule, node]
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10, maximum: 100 }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: 排行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TrafficTopItem'
+
+  /api/v1/traffic/export:
+    get:
+      tags: [traffic]
+      summary: 导出流量 CSV
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day]
+      responses:
+        '200':
+          description: CSV 文件
+          content:
+            text/csv:
+              schema:
+                type: string
+
+  /api/v1/traffic/dashboard:
+    get:
+      tags: [traffic]
+      summary: 首页仪表盘聚合数据
+      description: 一次请求拿到概览、曲线、节点状态与待处理事项。
+      responses:
+        '200':
+          description: 聚合数据
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DashboardData'
+
+  # ───────────────────────── 探针 ─────────────────────────
+  /api/v1/probe/overview:
+    get:
+      tags: [probe]
+      summary: 探针总览（所有节点最新指标与迷你曲线）
+      responses:
+        '200':
+          description: 总览
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          nodes:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                node:
+                                  $ref: '#/components/schemas/Node'
+                                latest:
+                                  $ref: '#/components/schemas/ProbeMetric'
+                                sparkline:
+                                  type: array
+                                  items:
+                                    $ref: '#/components/schemas/ProbeMetric'
+
+  /api/v1/probe/nodes/{id}:
+    get:
+      tags: [probe]
+      summary: 单个节点的探针数据
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: interval
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: 指标序列
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ProbeMetric'
+
+  /api/v1/probe/cleanup:
+    get:
+      tags: [probe]
+      summary: 手动触发探针数据清理
+      responses:
+        '200':
+          description: 清理结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          deleted: { type: integer, format: int64 }
+
+  # ───────────────────────── 系统 ─────────────────────────
+  /api/v1/health:
+    get:
+      tags: [system]
+      summary: 存活检查
+      security: []
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/system/info:
+    get:
+      tags: [system]
+      summary: 系统信息
+      responses:
+        '200':
+          description: 系统信息
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SystemInfo'
+
+  /api/v1/system/status:
+    get:
+      tags: [system]
+      summary: 健康检查（数据库、任务调度、节点通信）
+      responses:
+        '200':
+          description: 健康状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SystemStatus'
+
+  /api/v1/system/version:
+    get:
+      tags: [system]
+      summary: 后端与节点客户端版本清单
+      responses:
+        '200':
+          description: 版本清单
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          backend: { type: string }
+                          node_client: { type: string }
+                          build: { type: string }
+
+  /api/v1/system/errors:
+    get:
+      tags: [system]
+      summary: 完整错误码字典
+      responses:
+        '200':
+          description: 字典
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            code: { type: integer }
+                            message: { type: string }
+                            http_status: { type: integer }
+
+  /api/v1/system/openapi.json:
+    get:
+      tags: [system]
+      summary: 运行时 OpenAPI 描述
+      security: []
+      responses:
+        '200':
+          description: OpenAPI 3.1 文档
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/v1/settings:
+    get:
+      tags: [system]
+      summary: 全部设置
+      responses:
+        '200':
+          description: 设置键值
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        additionalProperties: true
+    put:
+      tags: [system]
+      summary: 批量更新设置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        additionalProperties: true
+
+  /api/v1/audit-logs:
+    get:
+      tags: [system]
+      summary: 审计日志
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: user_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: resource
+          in: query
+          schema: { type: string }
+        - name: result
+          in: query
+          schema:
+            type: string
+            enum: [success, failed]
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: 审计日志
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/AuditLog'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+
+  /api/v1/tasks:
+    get:
+      tags: [system]
+      summary: 后台任务列表与状态
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TaskStatus'
+
+  /api/v1/tasks/{name}/run:
+    post:
+      tags: [system]
+      summary: 手动触发任务
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - node_offline_check
+              - sync_rule
+              - collect_traffic
+              - compute_health
+              - detect_drift
+              - evaluate_alerts
+              - cleanup
+              - snapshot_daily
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/api-tokens:
+    get:
+      tags: [system]
+      summary: API Token 列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Token 列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/APIToken'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [system]
+      summary: 创建 API Token
+      description: 明文 Token 仅在本次响应中返回一次，之后库中只保留哈希。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/APITokenInput'
+      responses:
+        '200':
+          description: 创建成功（含明文 Token）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/APIToken'
+
+  /api/v1/api-tokens/{id}:
+    delete:
+      tags: [system]
+      summary: 删除 API Token
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  # ───────────────────────── 告警 ─────────────────────────
+  /api/v1/alerts:
+    get:
+      tags: [alert]
+      summary: 告警规则与活跃告警
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 告警数据
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          rules:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/AlertRule'
+                          active:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/AlertHistory'
+    post:
+      tags: [alert]
+      summary: 创建告警规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AlertRule'
+
+  /api/v1/alerts/history:
+    get:
+      tags: [alert]
+      summary: 告警历史
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: resolved
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: 告警历史
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/AlertHistory'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+
+  /api/v1/alerts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    put:
+      tags: [alert]
+      summary: 更新告警规则
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+      responses:
+        '200':
+          description: 更新后的规则
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AlertRule'
+    delete:
+      tags: [alert]
+      summary: 删除告警规则
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/alerts/{id}/test:
+    post:
+      tags: [alert]
+      summary: 测试通知渠道
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 各渠道的测试结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            channel: { type: string }
+                            ok: { type: boolean }
+                            error: { type: string }
+
+  /api/v1/alerts/{id}/resolve:
+    post:
+      tags: [alert]
+      summary: 标记告警已解决
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/webhooks/test:
+    post:
+      tags: [alert]
+      summary: 测试 Webhook 地址
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          ok: { type: boolean }
+                          status: { type: integer }
+                          error: { type: string }
+
+  # ───────────────────────── 快照 ─────────────────────────
+  /api/v1/snapshots:
+    get:
+      tags: [snapshot]
+      summary: 配置快照列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 快照列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ConfigSnapshot'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+    post:
+      tags: [snapshot]
+      summary: 手动生成快照
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+      responses:
+        '200':
+          description: 生成的快照
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ConfigSnapshot'
+
+  /api/v1/snapshots/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceID'
+    get:
+      tags: [snapshot]
+      summary: 快照详情
+      responses:
+        '200':
+          description: 快照
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ConfigSnapshot'
+    delete:
+      tags: [snapshot]
+      summary: 删除快照
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/v1/snapshots/{id}/diff:
+    get:
+      tags: [snapshot]
+      summary: 与当前配置对比
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 差异
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          added:
+                            type: array
+                            items: { type: string }
+                          removed:
+                            type: array
+                            items: { type: string }
+                          changed:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                path: { type: string }
+                                from: {}
+                                to: {}
+
+  /api/v1/snapshots/{id}/rollback:
+    post:
+      tags: [snapshot]
+      summary: 一键回滚
+      description: 回滚前会再生成一份「回滚前快照」，保证可逆。
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 回滚结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          pre_rollback_snapshot_id:
+                            type: integer
+                            format: int64
+
+  # ───────────────────────── 迁移 ─────────────────────────
+  /api/v1/migrations/precheck:
+    post:
+      tags: [migration]
+      summary: 迁移预检（不写任何数据）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MigrationInput'
+      responses:
+        '200':
+          description: 预检报告
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PrecheckReport'
+        '400':
+          description: 源库无法连接或版本不被支持
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiBody'
+
+  /api/v1/migrations/run:
+    post:
+      tags: [migration]
+      summary: 执行迁移
+      parameters:
+        - name: dry_run
+          in: query
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MigrationInput'
+      responses:
+        '200':
+          description: 迁移批次
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MigrateBatch'
+
+  /api/v1/migrations:
+    get:
+      tags: [migration]
+      summary: 迁移批次列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 批次列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/MigrateBatch'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+
+  /api/v1/migrations/{id}:
+    get:
+      tags: [migration]
+      summary: 批次详情与报告
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 批次
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MigrateBatch'
+
+  /api/v1/migrations/{id}/progress:
+    get:
+      tags: [migration]
+      summary: 实时进度
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 进度
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          batch_id: { type: integer, format: int64 }
+                          stage: { type: integer }
+                          stage_name: { type: string }
+                          total_rows: { type: integer, format: int64 }
+                          migrated_rows: { type: integer, format: int64 }
+                          percent: { type: number, format: float }
+                          message: { type: string }
+
+  /api/v1/migrations/{id}/rollback:
+    post:
+      tags: [migration]
+      summary: 回滚该批次
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 回滚结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          deleted_rows: { type: integer, format: int64 }
+
+  /api/v1/backups:
+    post:
+      tags: [migration]
+      summary: 生成备份
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                with_secret:
+                  type: boolean
+                  description: 是否在备份中包含 secret-key（默认脱敏）
+      responses:
+        '200':
+          description: 备份记录
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Backup'
+    get:
+      tags: [migration]
+      summary: 备份列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 备份列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/Backup'
+                          pagination:
+                            $ref: '#/components/schemas/Pagination'
+
+  /api/v1/backups/{id}/download:
+    get:
+      tags: [migration]
+      summary: 下载备份
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: zip 文件
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /api/v1/backups/{id}/restore:
+    post:
+      tags: [migration]
+      summary: 从备份恢复
+      description: 恢复前会自动把当前数据备份为 data.db.before-restore。
+      parameters:
+        - $ref: '#/components/parameters/ResourceID'
+      responses:
+        '200':
+          description: 恢复结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          restored: { type: boolean }
+                          backup_path: { type: string }
+
+  # ───────────────────────── 节点通信 ─────────────────────────
+  /api/node/register:
+    post:
+      tags: [node-agent]
+      summary: 节点首次注册
+      description: 用请求体中的 token 认证，返回节点 ID 与初始配置。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                version: { type: string }
+                public_ipv4: { type: string }
+                public_ipv6: { type: string }
+                private_ip: { type: string }
+                os: { type: string }
+                arch: { type: string }
+                kernel_ver: { type: string }
+                cpu_model: { type: string }
+                cpu_cores: { type: integer }
+                mem_total: { type: integer, format: int64 }
+                disk_total: { type: integer, format: int64 }
+                boot_time: { type: string, format: date-time }
+      responses:
+        '200':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          node_id: { type: integer, format: int64 }
+                          config: {}
+
+  /api/node/heartbeat:
+    post:
+      tags: [node-agent]
+      summary: 节点心跳上报
+      security:
+        - nodeTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+      responses:
+        '200':
+          description: 心跳响应（含是否需要拉取新配置）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          need_config: { type: boolean }
+                          config_version: { type: integer, format: int64 }
+                          heartbeat_interval: { type: integer }
+
+  /api/node/config:
+    get:
+      tags: [node-agent]
+      summary: 拉取配置
+      security:
+        - nodeTokenAuth: []
+      parameters:
+        - name: version
+          in: query
+          description: 节点当前生效的配置版本；服务端据此决定是否返回增量
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 配置
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/NodeConfigPayload'
+
+  /api/node/report:
+    post:
+      tags: [node-agent]
+      summary: 上报同步结果与流量
+      security:
+        - nodeTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rule_results:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      rule_id: { type: integer, format: int64 }
+                      ok: { type: boolean }
+                      error: { type: string }
+                traffic:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      rule_id: { type: integer, format: int64 }
+                      user_id: { type: integer, format: int64 }
+                      direction:
+                        type: string
+                        enum: [in, out]
+                      raw_bytes: { type: integer, format: int64 }
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /api/node/tasks:
+    get:
+      tags: [node-agent]
+      summary: 拉取待执行任务
+      security:
+        - nodeTokenAuth: []
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiBody'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer, format: int64 }
+                            type:
+                              type: string
+                              enum: [upgrade, restart, exec]
+                            payload: {}
+
+  /api/node/task-result:
+    post:
+      tags: [node-agent]
+      summary: 上报任务执行结果
+      security:
+        - nodeTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, ok]
+              properties:
+                task_id: { type: integer, format: int64 }
+                ok: { type: boolean }
+                result: { type: string }
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+
+  /install.sh:
+    get:
+      tags: [node-agent]
+      summary: 节点一键安装脚本
+      security: []
+      parameters:
+        - name: t
+          in: query
+          description: 节点 token
+          schema: { type: string }
+        - name: u
+          in: query
+          description: 面板地址
+          schema: { type: string }
+      responses:
+        '200':
+          description: bash 脚本
+          content:
+            text/x-shellscript:
+              schema:
+                type: string
+
+  /uninstall.sh:
+    get:
+      tags: [node-agent]
+      summary: 节点卸载脚本
+      security: []
+      responses:
+        '200':
+          description: bash 脚本
+          content:
+            text/x-shellscript:
+              schema:
+                type: string
+
+  /api/node/binary/{arch}:
+    get:
+      tags: [node-agent]
+      summary: 节点二进制下载
+      security: []
+      parameters:
+        - name: arch
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [amd64, amd64v3, arm64]
+      responses:
+        '200':
+          description: 二进制
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT 访问令牌，由 /auth/login 或 /auth/refresh 获取
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API Token，创建时返回一次明文
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: or_session
+      description: WebUI 会话 Cookie（HttpOnly、SameSite=Lax）
+    nodeTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Node-Token
+      description: 节点密钥，由面板在创建节点时下发
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    Sort:
+      name: sort
+      in: query
+      description: 排序字段（只接受白名单内的字段名）
+      schema: { type: string }
+    Order:
+      name: order
+      in: query
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+    Keyword:
+      name: keyword
+      in: query
+      schema: { type: string }
+    ResourceID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: 幂等键；相同 key 的重复请求不会重复创建资源
+      schema: { type: string }
+
+  requestBodies:
+    BatchIDs:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ids]
+            properties:
+              ids:
+                type: array
+                items: { type: integer, format: int64 }
+
+  responses:
+    OK:
+      description: 操作成功
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    Unauthorized:
+      description: 未登录或令牌无效（40101 / 40102 / 40103 / 40104）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    NotFound:
+      description: 资源不存在（40401）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    Conflict:
+      description: 资源冲突（40901 名称重复 / 40902 端口占用 / 40903 被引用）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    ValidationFailed:
+      description: 业务校验失败（42201-42210）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    RateLimited:
+      description: 触发限流（42901）
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    NodeError:
+      description: 节点通信错误（60001 离线 / 60002 应用失败 / 60003 超时）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiBody'
+    BatchResult:
+      description: 批量操作结果
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ApiBody'
+              - type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      succeeded:
+                        type: array
+                        items: { type: integer, format: int64 }
+                      failed:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer, format: int64 }
+                            reason: { type: string }
+
+  schemas:
+    ApiBody:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: 0 表示成功，非 0 见错误码字典
+        message:
+          type: string
+        data: {}
+        details:
+          $ref: '#/components/schemas/ErrorDetails'
+        request_id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    ErrorDetails:
+      type: object
+      properties:
+        field: { type: string }
+        value: {}
+        hint: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer, format: int64 }
+        total_pages: { type: integer }
+
+    LoginResult:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: 访问令牌有效期（秒） }
+        user:
+          $ref: '#/components/schemas/User'
+        captcha_required: { type: boolean }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        username: { type: string }
+        nickname: { type: string }
+        role:
+          type: string
+          enum: [admin, user]
+        status:
+          type: integer
+          description: 1 启用 0 禁用
+        group_id: { type: integer, format: int64 }
+        token: { type: string, description: 用户级订阅 Token }
+        traffic_used: { type: integer, format: int64, description: 已用流量（字节，按倍率折算后） }
+        traffic_limit: { type: integer, format: int64, description: 0 表示不限 }
+        speed_limit: { type: integer, format: int64, description: byte/s，0 表示不限 }
+        ip_limit: { type: integer }
+        device_limit: { type: integer }
+        conn_limit: { type: integer }
+        password_reset_required: { type: boolean }
+        pending_reinstall: { type: boolean }
+        expire_at: { type: string, format: date-time, nullable: true }
+        last_login_at: { type: string, format: date-time, nullable: true }
+        last_login_ip: { type: string }
+        remark: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    UserInput:
+      type: object
+      required: [username]
+      properties:
+        username: { type: string, maxLength: 64 }
+        password: { type: string, format: password, minLength: 6 }
+        nickname: { type: string, maxLength: 64 }
+        role:
+          type: string
+          enum: [admin, user]
+          default: user
+        group_id: { type: integer, format: int64 }
+        traffic_limit: { type: integer, format: int64 }
+        speed_limit: { type: integer, format: int64 }
+        ip_limit: { type: integer }
+        device_limit: { type: integer }
+        conn_limit: { type: integer }
+        expire_at: { type: string, format: date-time, nullable: true }
+        remark: { type: string }
+
+    UserGroup:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        traffic_limit: { type: integer, format: int64 }
+        speed_limit: { type: integer, format: int64 }
+        ip_limit: { type: integer }
+        conn_limit: { type: integer }
+        rule_group_ids:
+          type: array
+          description: 可访问的规则分组白名单，空数组表示全部可访问
+          items: { type: integer, format: int64 }
+        remark: { type: string }
+
+    UserGroupInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 64 }
+        traffic_limit: { type: integer, format: int64 }
+        speed_limit: { type: integer, format: int64 }
+        ip_limit: { type: integer }
+        conn_limit: { type: integer }
+        rule_group_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        remark: { type: string }
+
+    Node:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        token: { type: string }
+        role:
+          type: string
+          enum: [inbound, outbound, both]
+        public_ipv4: { type: string }
+        public_ipv6: { type: string }
+        private_ip: { type: string }
+        connect_host: { type: string, description: 静态连接地址（出口用） }
+        is_static: { type: boolean }
+        direct_port: { type: integer }
+        ws_port: { type: integer }
+        tls_port: { type: integer }
+        udp_port: { type: integer }
+        rev_port: { type: integer, description: 反向隧道端口 }
+        group_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        online: { type: boolean }
+        last_seen: { type: string, format: date-time, nullable: true }
+        weight: { type: integer, description: 负载均衡权重 }
+        max_conn: { type: integer, description: 0 表示不限 }
+        os: { type: string }
+        arch: { type: string }
+        kernel_ver: { type: string }
+        client_ver: { type: string }
+        cpu_model: { type: string }
+        cpu_cores: { type: integer }
+        mem_total: { type: integer, format: int64 }
+        disk_total: { type: integer, format: int64 }
+        boot_time: { type: string, format: date-time, nullable: true }
+        current_conn: { type: integer }
+        net_in_speed: { type: integer, format: int64 }
+        net_out_speed: { type: integer, format: int64 }
+        cpu_usage: { type: number, format: float }
+        mem_used: { type: integer, format: int64 }
+        disk_used: { type: integer, format: int64 }
+        load1: { type: number, format: float }
+        uptime: { type: integer, format: int64 }
+        config_version: { type: integer, format: int64 }
+        last_error: { type: string }
+        health_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: 健康度评分（综合在线率、同步失败率、CPU/内存水位）
+        drift_detected: { type: boolean }
+        drift_detail: {}
+        remark: { type: string }
+
+    NodeCreateInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 64 }
+        role:
+          type: string
+          enum: [inbound, outbound, both]
+          default: both
+        group_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        weight: { type: integer, default: 1 }
+        max_conn: { type: integer, default: 0 }
+        connect_host: { type: string }
+        is_static: { type: boolean }
+        remark: { type: string }
+
+    NodeUpdateInput:
+      $ref: '#/components/schemas/NodeCreateInput'
+
+    NodeCreateResult:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        token: { type: string }
+        install_command: { type: string }
+        status: { type: string }
+
+    NodeGroup:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        remark: { type: string }
+
+    NodeGroupInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 64 }
+        remark: { type: string }
+
+    DeviceGroup:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        type:
+          type: string
+          enum: [inbound, outbound]
+        node_ids:
+          type: array
+          description: 组成员（有序；出口组的顺序参与负载均衡决策）
+          items: { type: integer, format: int64 }
+        config: {}
+        balance:
+          type: string
+          enum: [least_conn, round_robin, hash_ip, weighted]
+        health_check_enable: { type: boolean }
+        health_check_interval: { type: integer }
+        health_check_timeout: { type: integer }
+        health_check_fail_count: { type: integer }
+        health_check_succ_count: { type: integer }
+        failover_group_id:
+          type: integer
+          format: int64
+          description: 本组全挂时转投的组；必须与当前组拥有相同的入口权限配置
+        remark: { type: string }
+
+    DeviceGroupInput:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, maxLength: 64 }
+        type: { type: string, enum: [inbound, outbound] }
+        node_ids:
+          type: array
+          items: { type: integer, format: int64 }
+        config: {}
+        balance:
+          type: string
+          enum: [least_conn, round_robin, hash_ip, weighted]
+          default: least_conn
+        health_check_enable: { type: boolean, default: true }
+        health_check_interval: { type: integer, default: 10 }
+        health_check_timeout: { type: integer, default: 3 }
+        health_check_fail_count: { type: integer, default: 3 }
+        health_check_succ_count: { type: integer, default: 2 }
+        failover_group_id: { type: integer, format: int64 }
+        remark: { type: string }
+
+    DeviceGroupSchema:
+      type: object
+      properties:
+        type: { type: string, enum: [inbound, outbound] }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              label: { type: string }
+              type:
+                type: string
+                enum: [string, number, boolean, array, select, text, object]
+              default: {}
+              options:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    label: { type: string }
+                    value: {}
+              required: { type: boolean }
+              min: { type: number }
+              max: { type: number }
+              help: { type: string }
+              risk: { type: boolean, description: 是否标记为风险项 }
+
+    GroupHealth:
+      type: object
+      properties:
+        group_id: { type: integer, format: int64 }
+        group_name: { type: string }
+        available: { type: integer }
+        total: { type: integer }
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              node_id: { type: integer, format: int64 }
+              node_name: { type: string }
+              online: { type: boolean }
+              healthy: { type: boolean }
+              current_conn: { type: integer }
+              weight: { type: integer }
+              load_ratio: { type: number, format: float }
+              fail_count: { type: integer }
+
+    ForwardRule:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        user_id: { type: integer, format: int64 }
+        rule_group_id: { type: integer, format: int64 }
+        inbound_group_id: { type: integer, format: int64 }
+        listen_port:
+          type: integer
+          description: 0 表示随机端口
+        listen_port_end:
+          type: integer
+          description: 端口段结束；0 表示单端口
+        outbound_group_id:
+          type: integer
+          format: int64
+          description: 0 表示单端（入口直出）
+        targets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Target'
+        target_balance:
+          type: string
+          enum: [failover, least_conn, round_robin, weighted, hash_ip]
+        inbound_multiplier:
+          type: number
+          format: float
+          description: 范围 0~100，最多 2 位小数
+        outbound_multiplier:
+          type: number
+          format: float
+        speed_limit:
+          type: integer
+          format: int64
+          description: byte/s，0 表示不限
+        conn_limit: { type: integer }
+        ip_limit: { type: integer }
+        options: {}
+        chain_groups:
+          type: array
+          description: 链式出口设备组 ID（长度 2 或 3）
+          items: { type: integer, format: int64 }
+        reverse_enable: { type: boolean }
+        reverse_port: { type: integer }
+        reverse_group_id: { type: integer, format: int64 }
+        is_sub_rule: { type: boolean }
+        parent_id: { type: integer, format: int64 }
+        sni: { type: string }
+        shaping:
+          type: array
+          description: 整流选项：1 拒绝 TLS1.2，2 拒绝全部 TLS，3 拒绝 HTTP/1.x，4 拒绝 WS，2000 跳过 IPv6
+          items: { type: integer }
+        sync_status:
+          type: string
+          enum: [unsynced, syncing, normal, failed]
+        sync_error:
+          type: string
+          description: 同步失败时节点返回的原始错误
+        synced_at: { type: string, format: date-time, nullable: true }
+        traffic_in:
+          type: integer
+          format: int64
+          description: 累计入口流量（字节，已乘倍率）
+        traffic_out:
+          type: integer
+          format: int64
+        enable: { type: boolean }
+        remark: { type: string }
+
+    ForwardRuleInput:
+      type: object
+      required: [name, inbound_group_id, listen_port, targets]
+      properties:
+        name: { type: string, maxLength: 128 }
+        user_id: { type: integer, format: int64 }
+        rule_group_id: { type: integer, format: int64 }
+        inbound_group_id: { type: integer, format: int64 }
+        listen_port: { type: integer }
+        listen_port_end: { type: integer }
+        outbound_group_id: { type: integer, format: int64 }
+        targets:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Target'
+        target_balance:
+          type: string
+          enum: [failover, least_conn, round_robin, weighted, hash_ip]
+          default: failover
+        inbound_multiplier:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          default: 1
+        outbound_multiplier:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          default: 1
+        speed_limit: { type: integer, format: int64 }
+        conn_limit: { type: integer }
+        ip_limit: { type: integer }
+        options: {}
+        chain_groups:
+          type: array
+          items: { type: integer, format: int64 }
+        reverse_enable: { type: boolean }
+        reverse_port: { type: integer }
+        reverse_group_id: { type: integer, format: int64 }
+        sni: { type: string }
+        shaping:
+          type: array
+          items: { type: integer }
+        enable: { type: boolean, default: true }
+        remark: { type: string }
+
+    Target:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: string
+          description: 域名或 IP
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        weight: { type: integer, default: 1 }
+        status:
+          type: string
+          enum: [up, down]
+          description: down 的目标不参与分发
+
+    BatchActionRequest:
+      type: object
+      required: [action, ids]
+      properties:
+        action:
+          type: string
+          enum:
+            - enable
+            - disable
+            - delete
+            - set_rule_group
+            - set_multiplier
+            - scale_multiplier
+            - set_outbound_group
+            - set_limits
+            - set_chain
+        ids:
+          type: array
+          items: { type: integer, format: int64 }
+        params:
+          type: object
+          additionalProperties: true
+
+    ImportRequest:
+      type: object
+      required: [format, content]
+      properties:
+        format:
+          type: string
+          enum: [text, json]
+        content: { type: string }
+        inbound_group_id: { type: integer, format: int64 }
+        outbound_group_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+
+    ImportPreview:
+      type: object
+      properties:
+        total: { type: integer }
+        will_create: { type: integer }
+        conflicts:
+          type: array
+          items:
+            type: object
+            properties:
+              line: { type: integer }
+              name: { type: string }
+              reason: { type: string }
+              suggestion: { type: string }
+        invalid:
+          type: array
+          items:
+            type: object
+            properties:
+              line: { type: integer }
+              raw: { type: string }
+              reason: { type: string }
+
+    RuleGroup:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        sort: { type: integer }
+        remark: { type: string }
+
+    RuleGroupInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 64 }
+        sort: { type: integer }
+        remark: { type: string }
+
+    ReorderRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          items: { type: integer, format: int64 }
+
+    TrafficPoint:
+      type: object
+      properties:
+        time:
+          type: string
+          description: 时间桶标识（按小时为 YYYY-MM-DD HH:00，按天为 YYYY-MM-DD）
+        bytes:
+          type: integer
+          format: int64
+          description: 乘倍率后的字节数
+        raw_bytes:
+          type: integer
+          format: int64
+          description: 实际字节数
+
+    TrafficOverview:
+      type: object
+      properties:
+        today: { type: integer, format: int64 }
+        yesterday: { type: integer, format: int64 }
+        this_month: { type: integer, format: int64 }
+        total: { type: integer, format: int64 }
+        online_users: { type: integer }
+        online_nodes: { type: integer }
+        total_nodes: { type: integer }
+        active_rules: { type: integer }
+
+    TrafficTopItem:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        bytes: { type: integer, format: int64 }
+        raw_bytes: { type: integer, format: int64 }
+
+    DashboardData:
+      type: object
+      properties:
+        overview:
+          $ref: '#/components/schemas/TrafficOverview'
+        timeseries:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficPoint'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        pending:
+          type: object
+          properties:
+            sync_failed_rules:
+              type: array
+              items:
+                $ref: '#/components/schemas/ForwardRule'
+            offline_nodes:
+              type: array
+              items:
+                $ref: '#/components/schemas/Node'
+            active_alerts:
+              type: array
+              items:
+                $ref: '#/components/schemas/AlertHistory'
+
+    ProbeMetric:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        node_id: { type: integer, format: int64 }
+        timestamp: { type: integer, format: int64, description: Unix 秒 }
+        cpu: { type: number, format: float, description: 使用率 0~100 }
+        mem_used: { type: integer, format: int64 }
+        mem_total: { type: integer, format: int64 }
+        swap_used: { type: integer, format: int64 }
+        swap_total: { type: integer, format: int64 }
+        disk_used: { type: integer, format: int64 }
+        disk_total: { type: integer, format: int64 }
+        net_in: { type: integer, format: int64 }
+        net_out: { type: integer, format: int64 }
+        net_in_speed: { type: integer, format: int64 }
+        net_out_speed: { type: integer, format: int64 }
+        load1: { type: number, format: float }
+        load5: { type: number, format: float }
+        load15: { type: number, format: float }
+        tcp_conn: { type: integer }
+        udp_conn: { type: integer }
+        uptime: { type: integer, format: int64 }
+
+    Session:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        rule_id: { type: integer, format: int64 }
+        node_id: { type: integer, format: int64 }
+        client_ip: { type: string }
+        client_ip_hash: { type: string }
+        device_id: { type: string }
+        conn_count: { type: integer }
+        protocol:
+          type: string
+          enum: [ws, http, tls, direct, udp]
+        started_at: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        upload: { type: integer, format: int64 }
+        download: { type: integer, format: int64 }
+
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        username: { type: string }
+        action:
+          type: string
+          description: create | update | delete | login | sync | migrate ...
+        resource: { type: string }
+        resource_id: { type: integer, format: int64 }
+        before: { description: 变更前快照 }
+        after: { description: 变更后快照 }
+        ip: { type: string }
+        user_agent: { type: string }
+        result:
+          type: string
+          enum: [success, failed]
+        message: { type: string }
+        created_at: { type: string, format: date-time }
+
+    APIToken:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        token:
+          type: string
+          description: 明文 Token，仅在创建时返回一次
+        scopes:
+          type: array
+          items: { type: string }
+        ip_whitelist:
+          type: array
+          items: { type: string }
+        expire_at: { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        enabled: { type: boolean }
+
+    APITokenInput:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: { type: string, maxLength: 64 }
+        scopes:
+          type: array
+          items:
+            type: string
+            enum:
+              - node:read
+              - node:write
+              - node:exec
+              - group:read
+              - group:write
+              - rule:read
+              - rule:write
+              - user:read
+              - user:write
+              - traffic:read
+              - system:read
+              - system:write
+              - migrate:run
+              - backup:run
+        ip_whitelist:
+          type: array
+          description: CIDR 列表，空数组表示不限制
+          items: { type: string }
+        expire_at: { type: string, format: date-time, nullable: true }
+
+    AlertRule:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        type:
+          type: string
+          enum:
+            - node_offline
+            - node_cpu
+            - node_mem
+            - node_disk
+            - rule_sync_failed
+            - user_traffic_pct
+            - rule_traffic_pct
+            - node_traffic_pct
+            - cert_expire
+        target_id:
+          type: integer
+          format: int64
+          description: 关联节点/用户/规则 ID，0 表示全局
+        threshold: { type: number, format: float }
+        duration:
+          type: integer
+          description: 持续时长（秒）后才触发，用于防抖
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlertChannel'
+        silence_for:
+          type: integer
+          description: 静默期（秒），避免重复通知
+        enabled: { type: boolean }
+        last_fired_at: { type: string, format: date-time, nullable: true }
+
+    AlertRuleInput:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, maxLength: 128 }
+        type: { type: string }
+        target_id: { type: integer, format: int64 }
+        threshold: { type: number, format: float }
+        duration: { type: integer }
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlertChannel'
+        silence_for: { type: integer, default: 300 }
+        enabled: { type: boolean, default: true }
+
+    AlertChannel:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [webhook, telegram, email]
+        url: { type: string, format: uri, description: webhook 地址 }
+        token: { type: string, description: Telegram bot token }
+        chat: { type: string, description: Telegram chat id }
+        host: { type: string, description: SMTP 主机 }
+        port: { type: integer, description: SMTP 端口 }
+        user: { type: string }
+        pass: { type: string }
+        to: { type: string, description: 收件人 }
+
+    AlertHistory:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        rule_id: { type: integer, format: int64 }
+        level:
+          type: string
+          enum: [info, warning, critical]
+        title: { type: string }
+        content: { type: string }
+        resolved: { type: boolean }
+        resource: { type: string }
+        resource_id: { type: integer, format: int64 }
+        fired_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+
+    ConfigSnapshot:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        reason:
+          type: string
+          description: manual | auto_before_sync | auto_daily | before_migrate
+        checksum: { type: string }
+        rule_count: { type: integer }
+        group_count: { type: integer }
+        node_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    SystemInfo:
+      type: object
+      properties:
+        version: { type: string }
+        build: { type: string }
+        uptime: { type: integer, format: int64 }
+        database: { type: string }
+        node_count: { type: integer }
+        online_node_count: { type: integer }
+        rule_count: { type: integer }
+        user_count: { type: integer }
+        schema_version: { type: integer }
+        subscriber_count: { type: integer }
+        config_version: { type: integer, format: int64 }
+
+    SystemStatus:
+      type: object
+      properties:
+        healthy: { type: boolean }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              ok: { type: boolean }
+              message: { type: string }
+
+    TaskStatus:
+      type: object
+      properties:
+        name: { type: string }
+        desc: { type: string }
+        interval_sec: { type: integer }
+        running: { type: boolean }
+        last_run_at: { type: string, format: date-time, nullable: true }
+        last_result: { type: string }
+        last_error: { type: string }
+        next_run_at: { type: string, format: date-time, nullable: true }
+
+    MigrateBatch:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        source: { type: string, enum: [nyanpass, openroute] }
+        source_dsn: { type: string, description: 脱敏后存储 }
+        target_dsn: { type: string }
+        status:
+          type: string
+          enum: [pending, running, finished, failed, rolled_back]
+        stage:
+          type: integer
+          minimum: 1
+          maximum: 7
+          description: 当前阶段
+        dry_run: { type: boolean }
+        total_rows: { type: integer, format: int64 }
+        migrated_rows: { type: integer, format: int64 }
+        report: { description: 完整预检/迁移报告 }
+        backup_path: { type: string }
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    MigrationInput:
+      type: object
+      required: [source, dsn]
+      properties:
+        source:
+          type: string
+          enum: [nyanpass, openroute]
+        dsn:
+          type: string
+          description: 源库 DSN，支持 sqlite3 / mysql / postgres
+          example: 'sqlite3:///old/nyanpass/data.db'
+        rename_policy:
+          type: string
+          enum: [fail, suffix, skip]
+          default: fail
+          description: 名称冲突处理策略
+
+    PrecheckReport:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            source: { type: string }
+            source_version: { type: string }
+            target: { type: string }
+            mode: { type: string }
+        tables:
+          type: array
+          items:
+            type: object
+            properties:
+              source_table: { type: string }
+              target_table: { type: string }
+              rows: { type: integer, format: int64 }
+              note: { type: string }
+        conflicts:
+          type: object
+          properties:
+            name_conflicts:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  names:
+                    type: array
+                    items: { type: string }
+                  suggestion: { type: string }
+            port_conflicts:
+              type: array
+              items:
+                type: object
+                properties:
+                  group: { type: string }
+                  port: { type: integer }
+                  rules:
+                    type: array
+                    items: { type: string }
+            missing_refs:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule: { type: string }
+                  missing: { type: string }
+            zero_multiplier_groups:
+              type: array
+              items: { type: string }
+        discarded_fields:
+          type: array
+          description: 不迁移的字段（丢弃清单）
+          items: { type: string }
+        filled_fields:
+          type: array
+          items: { type: string }
+        samples:
+          type: array
+          items:
+            type: object
+            properties:
+              before: { type: string }
+              after: { type: string }
+        suggestions:
+          type: array
+          items: { type: string }
+        text:
+          type: string
+          description: 与终端同款的纯文本报告
+        has_blocking_conflict: { type: boolean }
+
+    Backup:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        path: { type: string }
+        size: { type: integer, format: int64 }
+        checksum: { type: string }
+        manifest: {}
+        with_secret: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    HeartbeatRequest:
+      type: object
+      required: [node_id]
+      properties:
+        node_id: { type: integer, format: int64 }
+        version: { type: string }
+        config_version: { type: integer, format: int64 }
+        metrics:
+          $ref: '#/components/schemas/NodeMetrics'
+        running_rules:
+          type: array
+          items:
+            type: object
+            properties:
+              rule_id: { type: integer, format: int64 }
+              port: { type: integer }
+              status:
+                type: string
+                enum: [running, stopped, failed]
+              conn: { type: integer }
+        timestamp: { type: integer, format: int64 }
+
+    NodeMetrics:
+      type: object
+      properties:
+        cpu: { type: number, format: float }
+        mem_used: { type: integer, format: int64 }
+        mem_total: { type: integer, format: int64 }
+        disk_used: { type: integer, format: int64 }
+        disk_total: { type: integer, format: int64 }
+        net_in: { type: integer, format: int64 }
+        net_out: { type: integer, format: int64 }
+        net_in_speed: { type: integer, format: int64 }
+        net_out_speed: { type: integer, format: int64 }
+        load1: { type: number, format: float }
+        load5: { type: number, format: float }
+        load15: { type: number, format: float }
+        tcp_conn: { type: integer }
+        udp_conn: { type: integer }
+        uptime: { type: integer, format: int64 }
+
+    NodeConfigPayload:
+      type: object
+      properties:
+        config_version: { type: integer, format: int64 }
+        full:
+          type: boolean
+          description: 是否为全量配置；false 表示增量
+        rules:
+          type: array
+          items:
+            type: object
+            properties:
+              rule_id: { type: integer, format: int64 }
+              name: { type: string }
+              listen_port: { type: integer }
+              protocol: { type: string }
+              targets:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Target'
+              options: {}
+              speed_limit: { type: integer, format: int64 }
+              conn_limit: { type: integer }
+              ip_limit: { type: integer }
+              enable: { type: boolean }
+        removed_rule_ids:
+          type: array
+          description: 增量下发时被移除的规则 ID
+          items: { type: integer, format: int64 }
+        device_group_config: {}
+        heartbeat_interval: { type: integer }

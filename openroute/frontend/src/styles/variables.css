@@ -1,0 +1,96 @@
+/**
+ * 主题变量层（规格书 6.16）。
+ *
+ * 所有颜色、间距、圆角都走 CSS 变量，切换主题只需替换 <html> 上的 class。
+ * 新增主题时只需在这里补一组变量，无需改动任何组件。
+ */
+
+:root {
+  /* ── 中性色 ─────────────────────────────────────────── */
+  --or-text-primary: #1f2329;
+  --or-text-secondary: #4e5969;
+  --or-text-tertiary: #86909c;
+  --or-text-disabled: #c9cdd4;
+
+  --or-border: #e5e6eb;
+  --or-border-strong: #c9cdd4;
+  --or-divider: #f2f3f5;
+
+  /* ── 品牌色 ─────────────────────────────────────────── */
+  --or-primary: #165dff;
+  --or-primary-hover: #4080ff;
+  --or-primary-active: #0e42d2;
+  --or-primary-bg: #e8f3ff;
+
+  /* ── 语义色 ─────────────────────────────────────────── */
+  --or-success: #00b42a;
+  --or-success-bg: #e8ffea;
+  --or-warning: #ff7d00;
+  --or-warning-bg: #fff7e8;
+  --or-error: #f53f3f;
+  --or-error-bg: #ffece8;
+  --or-info: #165dff;
+  --or-info-bg: #e8f3ff;
+  /* 同步中（蓝色），与规格书 5.4 的状态机配色对应 */
+  --or-syncing: #165dff;
+  --or-unsynced: #ff7d00;
+
+  /* ── 表面 ───────────────────────────────────────────── */
+  --or-bg-layout: #f7f8fa;
+  --or-bg-container: #ffffff;
+  --or-bg-elevated: #ffffff;
+  --or-bg-header: #ffffff;
+  --or-bg-sider: #ffffff;
+  --or-bg-hover: #f2f3f5;
+
+  /* ── 形状与阴影 ─────────────────────────────────────── */
+  --or-radius: 6px;
+  --or-radius-lg: 10px;
+  --or-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 8px rgba(0, 0, 0, 0.04);
+  --or-shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.08);
+
+  /* ── 布局尺寸 ───────────────────────────────────────── */
+  --or-header-height: 56px;
+  --or-sider-width: 208px;
+  --or-sider-width-collapsed: 56px;
+}
+
+/**
+ * 经典主题：默认的白底蓝调，与 antd 默认风格接近。
+ */
+.theme-classic {
+  --or-bg-layout: #f7f8fa;
+  --or-bg-container: #ffffff;
+  --or-bg-header: #ffffff;
+  --or-bg-sider: #ffffff;
+  --or-text-primary: #1f2329;
+}
+
+/**
+ * 透明主题：侧边栏与顶栏使用半透明背景 + 背景渐变，
+ * 卡片带毛玻璃效果。适合配合自定义背景图使用。
+ */
+.theme-transparent {
+  --or-bg-layout: #eef2f7;
+  --or-bg-container: rgba(255, 255, 255, 0.78);
+  --or-bg-header: rgba(255, 255, 255, 0.72);
+  --or-bg-sider: rgba(255, 255, 255, 0.72);
+  --or-bg-hover: rgba(255, 255, 255, 0.9);
+  --or-border: rgba(229, 230, 235, 0.7);
+  --or-shadow: 0 1px 2px rgba(31, 35, 41, 0.06), 0 4px 16px rgba(31, 35, 41, 0.06);
+}
+
+/* 透明主题下给 body 铺一层柔和渐变，让「透明」有东西可透。 */
+.theme-transparent body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(22, 93, 255, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(0, 180, 42, 0.08), transparent 55%),
+    var(--or-bg-layout);
+  background-attachment: fixed;
+}
+
+/* 透明主题下的毛玻璃效果。 */
+.theme-transparent .or-glass {
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+}
