@@ -23,6 +23,8 @@ listen: 0.0.0.0:18888
 
 # ── 前端静态资源 ──────────────────────────────────────────
 html-path: ./public
+# Linux node clients: <directory>/<arch>/rel_nodeclient
+node-binary-path: ./node-binaries
 
 # ── 面板密钥（首次启动自动生成随机值，请勿外泄）─────────────
 # 用于签发 Session/JWT、加密节点通信凭证
@@ -78,6 +80,7 @@ func Default() *Config {
 		MaxIdleConnection:        5,
 		Listen:                   "0.0.0.0:18888",
 		HTMLPath:                 "./public",
+		NodeBinaryPath:           "./node-binaries",
 		HeartbeatInterval:        10,
 		OfflineNodeTime:          20,
 		OfflineNodeRetentionTime: 86400,

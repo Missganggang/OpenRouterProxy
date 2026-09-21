@@ -26,6 +26,11 @@ die()  { printf '\n\033[1;31m[x] %s\033[0m\n' "$*" >&2; exit 1; }
 log "检查前置条件"
 [ -f "$SRC_DIR/openroute" ] || die "缺少 $SRC_DIR/openroute"
 [ -d "$SRC_DIR/public" ]    || die "缺少 $SRC_DIR/public/"
+for arch in amd64 amd64v3 arm64; do
+  binary="$SRC_DIR/node-binaries/$arch/rel_nodeclient"
+  [ -s "$binary" ] || die "缺少 $binary，请运行 deploy/build.ps1 构建节点客户端"
+  head -c 4 "$binary" | grep -q 'ELF' || die "$binary 不是 Linux ELF"
+done
 [ -f "$CERT_DIR/fullchain.pem" ] || die "缺少证书 $CERT_DIR/fullchain.pem"
 [ -f "$CERT_DIR/privkey.pem" ]   || die "缺少私钥 $CERT_DIR/privkey.pem"
 
@@ -74,7 +79,13 @@ fi
 # ── 2. 释放程序文件 ────────────────────────────────────────────
 log "释放程序文件到 $APP_DIR"
 mkdir -p "$APP_DIR"
-install -m 0755 "$SRC_DIR/openroute" "$APP_DIR/openroute"
+install -m 0755 "$SRC_DIR/openroute" "$APP_DIR/openroute.new"
+mv -f "$APP_DIR/openroute.new" "$APP_DIR/openroute"
+for arch in amd64 amd64v3 arm64; do
+  mkdir -p "$APP_DIR/node-binaries/$arch"
+  install -m 0755 "$SRC_DIR/node-binaries/$arch/rel_nodeclient" "$APP_DIR/node-binaries/$arch/rel_nodeclient.new"
+  mv -f "$APP_DIR/node-binaries/$arch/rel_nodeclient.new" "$APP_DIR/node-binaries/$arch/rel_nodeclient"
+done
 rm -rf "$APP_DIR/public"
 cp -r "$SRC_DIR/public" "$APP_DIR/public"
 echo "    二进制 $(stat -c %s "$APP_DIR/openroute") 字节，前端 $(find "$APP_DIR/public" -type f | wc -l) 个文件"

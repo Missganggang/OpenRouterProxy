@@ -36,6 +36,8 @@ type Config struct {
 
 	// 前端静态资源
 	HTMLPath string `yaml:"html-path" json:"html_path"`
+	// NodeBinaryPath stores Linux node clients by architecture, outside the WebUI.
+	NodeBinaryPath string `yaml:"node-binary-path" json:"node_binary_path"`
 
 	// 面板密钥
 	SecretKey string `yaml:"secret-key" json:"secret_key"`

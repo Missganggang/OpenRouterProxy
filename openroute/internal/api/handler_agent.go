@@ -1,6 +1,13 @@
 package api
 
 import (
+	"bytes"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/openroute/openroute/internal/agent"
@@ -71,8 +78,7 @@ func (h *Handlers) UninstallScript(c *gin.Context) {
 
 // NodeBinary 提供节点客户端二进制下载（规格书 8.16）。
 //
-// 本仓库不产出预编译的节点二进制，因此明确返回 404 与可读说明，
-// 而不是返回空文件让安装脚本静默失败。
+// Files are built from cmd/nodeclient and shipped beside the panel.
 func (h *Handlers) NodeBinary(c *gin.Context) {
 	arch := c.Param("arch")
 	switch arch {
@@ -82,7 +88,44 @@ func (h *Handlers) NodeBinary(c *gin.Context) {
 		return
 	}
 
-	response.Fail(c, response.New(response.CodeNotFound,
-		"当前部署未内置节点客户端二进制（arch="+arch+"）。"+
-			"请自行编译节点客户端后放到静态目录，或改用离线部署：本地构建后 scp 到 /opt/openroute/"))
+	dir := h.app.Config.NodeBinaryPath
+	if dir == "" {
+		dir = "./node-binaries"
+	}
+	version := c.Query("version")
+	if version != "" && version != "latest" {
+		if !nodeVersionPattern.MatchString(version) {
+			badRequest(c, "version", "版本号只能包含字母、数字、点、下划线和短横线，且以字母或数字开头")
+			return
+		}
+		dir = filepath.Join(dir, version)
+	}
+	filename := filepath.Join(dir, arch, agent.NodeBinaryName)
+	f, err := os.Open(filename)
+	if err != nil {
+		response.Fail(c, response.New(response.CodeNotFound,
+			"该架构或版本的节点客户端尚未部署，请重新构建并部署 node-binaries（arch="+arch+"）"))
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	var magic [4]byte
+	if err != nil || !info.Mode().IsRegular() {
+		response.Fail(c, response.New(response.CodeInternal, "节点客户端文件不可读"))
+		return
+	}
+	if _, err = io.ReadFull(f, magic[:]); err != nil || !bytes.Equal(magic[:], []byte{0x7f, 'E', 'L', 'F'}) {
+		response.Fail(c, response.New(response.CodeInternal, "节点客户端不是有效的 Linux ELF 文件，请重新部署"))
+		return
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		response.Fail(c, response.New(response.CodeInternal, "节点客户端文件不可读"))
+		return
+	}
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", `attachment; filename="rel_nodeclient"`)
+	c.Header("Cache-Control", "no-cache")
+	http.ServeContent(c.Writer, c.Request, agent.NodeBinaryName, info.ModTime(), f)
 }
+
+var nodeVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)

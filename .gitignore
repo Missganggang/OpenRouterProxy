@@ -5,6 +5,10 @@ openroute/openroute-linux-*.exe
 openroute/public/
 deploy/openroute
 deploy/openroute-deploy.tar.gz
+deploy/node-binaries/
+openroute/node-binaries/
+openroute/rel_nodeclient
+openroute/rel_nodeclient.exe
 sshexec/sshexec
 sshexec/sshexec.exe
 

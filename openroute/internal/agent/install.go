@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"text/template"
@@ -19,7 +18,7 @@ import (
 // 安装脚本的部署路径与命名约定（规格书 5.1 / 5.5）。
 const (
 	// NodeInstallDir 节点安装目录。
-	NodeInstallDir = "/opt/openroute"
+	NodeInstallDir = "/opt/openroute-node"
 	// NodeBinaryName 节点客户端二进制文件名（与规格书 5.5 的运维手册一致）。
 	NodeBinaryName = "rel_nodeclient"
 	// NodeServiceNameDefault 默认 systemd 服务名前缀。
@@ -166,8 +165,6 @@ func InstallScript(opt InstallOptions) string {
 		"BaseURL":     normalizeBase(opt.BaseURL),
 		"Token":       opt.Token,
 		"Service":     service,
-		"ServiceUnit": service + "-node",
-		"InstallDir":  NodeInstallDir,
 		"BinaryName":  NodeBinaryName,
 		"ConfigFile":  NodeConfigFileName,
 		"EnvFile":     NodeEnvFileName,
@@ -198,10 +195,7 @@ func UninstallScript(serviceName string) string {
 		service = NodeServiceNameDefault
 	}
 	data := map[string]interface{}{
-		"Service":     service,
-		"ServiceUnit": service + "-node",
-		"InstallDir":  NodeInstallDir,
-		"EnvFile":     NodeEnvFileName,
+		"Service": service,
 	}
 	var b strings.Builder
 	if err := uninstallTemplate.Execute(&b, data); err != nil {
@@ -212,13 +206,13 @@ func UninstallScript(serviceName string) string {
 
 // InstallScriptHandler 处理安装脚本下载（GET /api/node/install.sh，规格书 8.16）。
 //
-// 该接口不需要认证：脚本本身只包含面板地址与节点密钥两个参数，
-// 密钥必须由管理员从面板复制，泄露风险与安装命令本身一致。
+// 该接口不需要认证。匿名请求只生成通用脚本，节点密钥由管理员
+// 通过 bash 的 -t 参数传入，绝不从数据库挑选或公开节点密钥。
 //
 // 查询参数（全部可选，见下方说明）：
 //
 //	-u 面板地址（可选，缺省用请求本身推导出的地址）
-//	-t 节点密钥（可选，缺省取该面板上唯一 / 最近的节点）
+//	-t 节点密钥（可选，缺省时在运行脚本时提供）
 //	-s 服务名（可选，默认 openroute）
 //	-o 是否出口节点（可选，1 / true）
 //	-a 架构（可选，amd64 / amd64v3 / arm64）
@@ -230,10 +224,9 @@ func UninstallScript(serviceName string) string {
 //
 // 这里的 `-u` / `-t` 是传给 **bash** 的，curl 请求的是**不带任何查询串**的
 // `/install.sh`。因此如果本接口强制要求查询参数，面板自己生成的命令永远跑不通
-//（curl 拿到 400，`-f` 直接以错误退出）。
+// （curl 拿到 400，`-f` 直接以错误退出）。
 //
-// 脚本正文里的面板地址与密钥在「生成命令时」就已经渲染进去了，
-// 查询参数只用于覆盖，不作为必需项。
+// 查询参数提供默认值，运行脚本时的命令行参数优先。
 func (r *Registry) InstallScriptHandler(c *gin.Context) {
 	base := firstNonEmpty(c.Query("u"), c.Query("url"), c.Query("base_url"))
 	token := firstNonEmpty(c.Query("t"), c.Query("token"))
@@ -244,36 +237,17 @@ func (r *Registry) InstallScriptHandler(c *gin.Context) {
 		base = requestBaseURL(c)
 	}
 
-	// 密钥缺省时，退回「该面板上下发安装脚本最合适的那个节点」。
-	//
-	// 说明：这里不再因为缺参数而 400。裸请求 /install.sh 本身不包含任何鉴权信息，
-	// 它只是取一份把地址与密钥都内嵌好的脚本——而这两个值本来就等同于
-	// 「管理员从面板复制过去的安装命令」，泄露风险与之持平。
-	// 若面板上确实没有任何节点，才明确报错，告诉用户先去创建节点。
 	if strings.TrimSpace(token) == "" {
-		node, err := r.defaultInstallNode(c.Request.Context())
-		if err != nil {
-			c.String(http.StatusBadRequest,
-				"当前面板还没有任何节点，无法生成安装脚本。\n"+
-					"请先在面板「节点管理」中点击「添加节点」，再复制生成的安装命令到目标机器执行。\n")
-			return
-		}
-		r.writeInstallScript(c, base, node.Token)
+		r.writeInstallScript(c, base, "")
 		return
 	}
 
 	// 显式给了密钥：校验它确实存在，避免把无主的脚本发给攻击者做探测。
-	node, err := r.nodeByToken(c.Request.Context(), strings.TrimSpace(token))
+	_, err := r.nodeByToken(c.Request.Context(), strings.TrimSpace(token))
 	if err != nil {
 		ae := response.AsAppError(err)
 		c.String(ae.HTTPStatus, "%s\n", ae.Msg)
 		return
-	}
-
-	// 密钥有效时，若调用方没指定地址，优先用该节点注册时记录的连接地址，
-	// 其次才是从请求推导——两者通常一致。
-	if strings.TrimSpace(base) == "" {
-		base = firstNonEmpty(node.ConnectHost, requestBaseURL(c))
 	}
 
 	r.writeInstallScript(c, base, token)
@@ -295,6 +269,7 @@ func (r *Registry) writeInstallScript(c *gin.Context, base, token string) {
 
 	// 返回纯文本，前端用 curl -fsSL 直接管道给 bash。
 	c.Header("Content-Type", "text/x-shellscript; charset=utf-8")
+	c.Header("Cache-Control", "no-store")
 	c.Header("Content-Disposition", `inline; filename="install.sh"`)
 	c.String(http.StatusOK, "%s", InstallScript(opt))
 }
@@ -329,20 +304,6 @@ func requestBaseURL(c *gin.Context) string {
 		host = "127.0.0.1"
 	}
 	return scheme + "://" + strings.TrimRight(host, "/")
-}
-
-// defaultInstallNode 挑选「下发安装脚本时默认使用的节点」。
-//
-// 用于裸请求 /install.sh（不带 -t）的场景：此时调用方没有指定节点，
-// 选最近创建的一个——通常是管理员刚刚在面板上点「添加节点」建出来的那个。
-//
-// 参数 ctx 为上下文；返回节点与错误（面板上没有任何节点时返回错误）。
-func (r *Registry) defaultInstallNode(ctx context.Context) (*model.Node, error) {
-	var n model.Node
-	if err := r.app.DB.WithContext(ctx).Order("id DESC").First(&n).Error; err != nil {
-		return nil, err
-	}
-	return &n, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -389,293 +350,248 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// installTemplate 是安装脚本模板（规格书 5.1 + 5.3）。
-//
-// 保持「先探测、再下载、后注册」的顺序：任何一步失败都不会留下
-// 半装状态（下载到临时文件，校验通过才 mv 到目标位置）。
-var installTemplate = template.Must(template.New("install").Parse(`#!/usr/bin/env bash
-#
-# OpenRoute 节点一键安装脚本（由面板按 token 模板化生成）
-#
-# 用法：
-#   bash <(curl -fsSL {{.BaseURL}}/install.sh) -u {{.BaseURL}} -t <token>
-#
-# 支持的环境变量：
-#   S=openroute        服务名（默认 openroute），多实例部署时用于区分
-#   OPTIMIZE=1         启用内核网络参数优化（BBR、缓冲区、文件句柄）
-#   INSTALL_TOOLS=1    安装常用排查工具（iftop / mtr / tcpdump 等）
-#   DISABLE_EXECUTE=1  禁用 WebSSH 与远程升级
-#   BIND_INBOUND=...   限定入口监听绑定的网卡/地址
-#   COUNT_INTERFACE=.. 指定探针统计流量的网卡
-#   UUID=...           多实例部署时的实例唯一值
-#
+// shellQuote prevents template values from becoming shell syntax.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// uninstallBody is shared by downloaded and locally generated uninstallers.
+// Deriving the directory from a validated service prevents deleting the panel.
+const uninstallBody = `
+while getopts ":s:h" option; do
+  case "$option" in
+    s) SERVICE_NAME="$OPTARG" ;;
+    h) echo "用法：bash uninstall.sh [-s 服务名]"; exit 0 ;;
+    *) echo "卸载参数无效" >&2; exit 1 ;;
+  esac
+done
+shift "$((OPTIND - 1))"
+[ "$#" -eq 0 ] || { echo "不支持的位置参数" >&2; exit 1; }
+[[ "$SERVICE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || { echo "服务名无效" >&2; exit 1; }
+INSTALL_DIR="/opt/${SERVICE_NAME}-node"
+SERVICE_UNIT="${SERVICE_NAME}-node"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_UNIT}.service"
+[ "$(id -u)" = "0" ] || { echo "请以 root 身份运行卸载脚本" >&2; exit 1; }
+systemctl show-environment >/dev/null 2>&1 || { echo "systemd 未运行" >&2; exit 1; }
+echo "[OpenRoute] 停止并禁用服务 ${SERVICE_UNIT} ..."
+systemctl stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+systemctl disable "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+if [ -f "${SERVICE_FILE}" ]; then
+  rm -f -- "${SERVICE_FILE}"
+  systemctl daemon-reload
+  systemctl reset-failed "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+fi
+answer=""
+read -r -p "是否删除安装目录 ${INSTALL_DIR}（含配置与日志）？[y/N] " answer || true
+case "${answer}" in
+  y|Y|yes|YES)
+    [ ! -L "${INSTALL_DIR}" ] || { echo "拒绝删除符号链接目录" >&2; exit 1; }
+    rm -rf -- "${INSTALL_DIR}"
+    ;;
+  *) echo "[OpenRoute] 已保留 ${INSTALL_DIR}。" ;;
+esac
+echo "[OpenRoute] 卸载完成。"
+`
+
+var installTemplate = template.Must(template.New("install").Funcs(template.FuncMap{
+	"sh": shellQuote,
+}).Parse(`#!/usr/bin/env bash
+# OpenRoute 节点安装脚本。运行参数覆盖面板提供的默认值。
 set -euo pipefail
+umask 077
 
-# ── 参数 ────────────────────────────────────────────────────────────────
-PANEL_URL="{{.BaseURL}}"
-NODE_TOKEN="{{.Token}}"
-SERVICE_NAME="${S:-{{.Service}}}"
-ARCH_HINT="{{.Arch}}"
-NODE_VERSION="{{.Version}}"
-IS_OUTBOUND="{{.IsOutbound}}"
+PANEL_URL={{sh .BaseURL}}
+NODE_TOKEN={{sh .Token}}
+SERVICE_NAME={{sh .Service}}
+SERVICE_NAME="${S:-${SERVICE_NAME}}"
+ARCH_HINT={{sh .Arch}}
+NODE_VERSION={{sh .Version}}
+IS_OUTBOUND={{.IsOutbound}}
 
-INSTALL_DIR="{{.InstallDir}}"
+info() { printf '[OpenRoute] %s\n' "$*"; }
+warn() { printf '[OpenRoute] 警告：%s\n' "$*" >&2; }
+fail() { printf '[OpenRoute] 安装失败：%s\n' "$*" >&2; exit 1; }
+usage() {
+  echo "用法：bash install.sh -u 面板地址 -t 节点密钥 [-s 服务名] [-o 0|1] [-a auto|amd64|amd64v3|arm64] [-v 版本]"
+}
+while getopts ":u:t:s:o:a:v:h" option; do
+  case "$option" in
+    u) PANEL_URL="$OPTARG" ;;
+    t) NODE_TOKEN="$OPTARG" ;;
+    s) SERVICE_NAME="$OPTARG" ;;
+    o) IS_OUTBOUND="$OPTARG" ;;
+    a) ARCH_HINT="$OPTARG" ;;
+    v) NODE_VERSION="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) fail "选项 -${OPTARG} 缺少参数" ;;
+    *) usage >&2; fail "未知选项 -${OPTARG}" ;;
+  esac
+done
+shift "$((OPTIND - 1))"
+[ "$#" -eq 0 ] || fail "不支持的位置参数：$*"
+
+single_line() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
+[ -n "$PANEL_URL" ] || fail "缺少面板地址，请使用 -u"
+[ -n "$NODE_TOKEN" ] || fail "缺少节点密钥，请从面板复制安装命令（-t）"
+single_line "$NODE_TOKEN" || fail "节点密钥不能包含换行"
+[[ "$PANEL_URL" != *[[:space:]]* ]] || fail "面板地址不能包含空白字符"
+case "$PANEL_URL" in
+  http://*|https://*) ;;
+  *://*) fail "面板地址仅支持 http:// 或 https://" ;;
+  *) PANEL_URL="http://${PANEL_URL}" ;;
+esac
+PANEL_URL="${PANEL_URL%/}"
+[[ "$SERVICE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || fail "服务名仅支持 1 至 64 个字母、数字、下划线或连字符，且必须以字母或数字开头"
+[[ "$NODE_VERSION" =~ ^[a-zA-Z0-9._+-]*$ ]] || fail "版本号包含不支持的字符"
+case "$IS_OUTBOUND" in
+  1|true|yes|on) IS_OUTBOUND=true ;;
+  0|false|no|off) IS_OUTBOUND=false ;;
+  *) fail "-o 必须为 0 或 1" ;;
+esac
+case "$ARCH_HINT" in auto|amd64|amd64v3|arm64) ;; *) fail "不支持的架构 ${ARCH_HINT}" ;; esac
+
+# 面板通常位于 /opt/openroute；节点及各个实例使用独立目录。
+INSTALL_DIR="/opt/${SERVICE_NAME}-node"
 BINARY_PATH="${INSTALL_DIR}/{{.BinaryName}}"
 CONFIG_PATH="${INSTALL_DIR}/{{.ConfigFile}}"
 ENV_PATH="${INSTALL_DIR}/{{.EnvFile}}"
-LOCAL_CONFIG_PATH="${INSTALL_DIR}/{{.LocalConfig}}"
 MACHINE_ID_PATH="${INSTALL_DIR}/{{.MachineID}}"
-SERVICE_UNIT="{{.ServiceUnit}}"
+SERVICE_UNIT="${SERVICE_NAME}-node"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_UNIT}.service"
 UNINSTALL_PATH="${INSTALL_DIR}/{{.Uninstall}}"
 
-# ── 输出工具 ────────────────────────────────────────────────────────────
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; RESET='\033[0m'
-
-info()  { printf "${GREEN}[OpenRoute]${RESET} %s\n" "$*"; }
-warn()  { printf "${YELLOW}[OpenRoute]${RESET} %s\n" "$*"; }
-step()  { printf "${BLUE}[OpenRoute]${RESET} %s\n" "$*"; }
-fail()  { printf "${RED}[OpenRoute] 安装失败：%s${RESET}\n" "$*" >&2; exit 1; }
-
-# ── 1. 前置检查：root / 系统版本 / 架构 ─────────────────────────────────
-if [ "$(id -u)" != "0" ]; then
-  fail "请以 root 身份运行（当前用户不是 root）"
-fi
-
-if [ ! -f /etc/os-release ]; then
-  fail "无法识别系统发行版（缺少 /etc/os-release），仅支持 Debian {{.MinDebian}}+ / Ubuntu {{.MinUbuntu}}.04+"
-fi
+[ "$(id -u)" = "0" ] || fail "请以 root 身份运行"
+[ -f /etc/os-release ] || fail "无法识别系统发行版（缺少 /etc/os-release）"
 . /etc/os-release
-OS_ID="${ID:-unknown}"
-
-case "${OS_ID}" in
+case "${ID:-unknown}" in
   debian)
-    if [ "${VERSION_ID%%.*}" -lt {{.MinDebian}} ] 2>/dev/null; then
-      fail "Debian ${VERSION_ID} 版本过低，请使用 Debian {{.MinDebian}} 或更高版本"
-    fi
+    [ "${VERSION_ID%%.*}" -ge {{.MinDebian}} ] || fail "请使用 Debian {{.MinDebian}} 或更高版本"
     ;;
   ubuntu)
-    if [ "${VERSION_ID%%.*}" -lt {{.MinUbuntu}} ] 2>/dev/null; then
-      fail "Ubuntu ${VERSION_ID} 版本过低，请使用 Ubuntu {{.MinUbuntu}}.04 或更高版本"
-    fi
+    [ "${VERSION_ID%%.*}" -ge {{.MinUbuntu}} ] || fail "请使用 Ubuntu {{.MinUbuntu}}.04 或更高版本"
     ;;
-  *)
-    warn "当前系统为 ${OS_ID}，未在官方支持列表内（Debian {{.MinDebian}}+ / Ubuntu {{.MinUbuntu}}.04+），继续安装但可能不可用"
-    ;;
+  *) warn "当前系统未在支持列表内，继续安装" ;;
 esac
 
-# 架构探测：x86_64 默认使用 amd64，若 CPU 支持 x86-64-v3 指令集则升级为 amd64v3。
 detect_arch() {
-  local machine
-  machine="$(uname -m)"
-  case "${machine}" in
-    x86_64|amd64)
-      if grep -qE '(^| )(avx2|bmi2)( |$)' /proc/cpuinfo 2>/dev/null; then
-        echo "amd64v3"
-      else
-        echo "amd64"
-      fi
-      ;;
-    aarch64|arm64)
-      echo "arm64"
-      ;;
-    *)
-      fail "不支持的架构 ${machine}，仅支持 amd64 / amd64v3 / arm64"
-      ;;
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) fail "不支持的 CPU 架构，仅支持 amd64 / amd64v3 / arm64" ;;
   esac
 }
-
-if [ "${ARCH_HINT}" = "amd64" ] || [ "${ARCH_HINT}" = "amd64v3" ] || [ "${ARCH_HINT}" = "arm64" ]; then
-  TARGET_ARCH="${ARCH_HINT}"
-else
-  TARGET_ARCH="$(detect_arch)"
-fi
-info "系统 ${PRETTY_NAME:-${OS_ID}}，架构 ${TARGET_ARCH}"
-
-# ── 2. 依赖检查 ────────────────────────────────────────────────────────
-# 只要 curl / systemctl 存在即可运行；不依赖 APT 也能工作（二进制是静态编译）。
+# 自动选择通用 amd64；显式 -a amd64v3 可供确认支持完整 v3 指令集的机器使用。
+TARGET_ARCH="$ARCH_HINT"
+[ "$TARGET_ARCH" != auto ] || TARGET_ARCH="$(detect_arch)"
+info "系统 ${PRETTY_NAME:-${ID:-unknown}}，架构 ${TARGET_ARCH}"
 command -v curl >/dev/null 2>&1 || fail "缺少 curl，请先执行：apt update && apt install -y curl"
-if ! command -v systemctl >/dev/null 2>&1; then
-  fail "未检测到 systemd（systemctl 不存在），本脚本仅支持 systemd 托管的系统"
-fi
+command -v systemctl >/dev/null 2>&1 || fail "缺少 systemctl，本脚本需要 systemd"
+systemctl show-environment >/dev/null 2>&1 || fail "systemd 未运行，无法托管节点服务"
 
-if [ "${INSTALL_TOOLS:-0}" = "1" ]; then
-  step "安装常用排查工具 ..."
+if [ "${INSTALL_TOOLS:-0}" = 1 ]; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq || warn "apt update 失败，跳过工具安装"
-  apt-get install -y -qq iftop mtr-tiny tcpdump net-tools dnsutils curl || warn "部分工具安装失败，不影响节点运行"
+  apt-get update -qq || warn "apt update 失败"
+  apt-get install -y -qq iftop mtr-tiny tcpdump net-tools dnsutils curl || warn "部分排查工具安装失败"
 fi
 
-# ── 3. 下载二进制 ──────────────────────────────────────────────────────
-step "准备安装目录 ${INSTALL_DIR}"
-mkdir -p "${INSTALL_DIR}"
-
-if [ -n "${NODE_VERSION}" ]; then
-  BINARY_URL="${PANEL_URL}/api/node/binary/${TARGET_ARCH}?version=${NODE_VERSION}"
-else
-  BINARY_URL="${PANEL_URL}/api/node/binary/${TARGET_ARCH}"
-fi
-
+[ ! -L "$INSTALL_DIR" ] || fail "拒绝使用符号链接安装目录 ${INSTALL_DIR}"
+info "准备安装目录 ${INSTALL_DIR}"
+mkdir -p -- "$INSTALL_DIR"
+chmod 0700 "$INSTALL_DIR"
+TMP_BINARY=""
+TMP_CONFIG=""
+TMP_ENV=""
+TMP_SERVICE=""
+cleanup() { rm -f -- "$TMP_BINARY" "$TMP_CONFIG" "$TMP_ENV" "$TMP_SERVICE"; }
+trap cleanup EXIT
 TMP_BINARY="$(mktemp "${INSTALL_DIR}/.rel_nodeclient.XXXXXX")"
-trap 'rm -f "${TMP_BINARY}"' EXIT
-
+TMP_CONFIG="$(mktemp "${INSTALL_DIR}/.config.XXXXXX")"
+BINARY_URL="${PANEL_URL}/api/node/binary/${TARGET_ARCH}"
+[ -z "$NODE_VERSION" ] || BINARY_URL="${BINARY_URL}?version=${NODE_VERSION}"
 info "从面板下载节点客户端：${BINARY_URL}"
-if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "${TMP_BINARY}" "${BINARY_URL}"; then
-  rm -f "${TMP_BINARY}"
-  fail "下载节点客户端失败。
-  排查建议：
-    1. 确认面板地址可达：curl -fsSL ${PANEL_URL}
-    2. 确认 token 有效：面板「节点管理」中该节点仍存在
-    3. 若面板开启了 HTTPS，请把 -u 参数改为 https:// 开头
-    4. 网络受限时可用离线部署：本地下载二进制后 scp 到 ${BINARY_PATH}"
+curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$TMP_BINARY" "$BINARY_URL" || fail "下载节点客户端失败。请确认面板可达且已部署 ${TARGET_ARCH} 客户端；旧客户端和配置已保留。"
+[ -s "$TMP_BINARY" ] || fail "下载的客户端为空"
+chmod 0755 "$TMP_BINARY"
+"$TMP_BINARY" -h >/dev/null 2>&1 || fail "客户端自检失败，可能下载内容错误或 CPU 架构不匹配；旧客户端和配置已保留"
+
+MACHINE_UUID="${UUID:-}"
+if [ -z "$MACHINE_UUID" ] && [ -s "$MACHINE_ID_PATH" ]; then
+  MACHINE_UUID="$(cat "$MACHINE_ID_PATH")"
 fi
-chmod 0755 "${TMP_BINARY}"
-
-# 简单有效性校验：能打印帮助即视为可执行文件。
-if ! "${TMP_BINARY}" -h >/dev/null 2>&1; then
-  warn "二进制自检未通过（可能是架构不匹配），仍继续安装"
-fi
-mv -f "${TMP_BINARY}" "${BINARY_PATH}"
-trap - EXIT
-info "节点客户端已安装到 ${BINARY_PATH}"
-
-# ── 4. 写入 config.yml ─────────────────────────────────────────────────
-step "生成配置文件 ${CONFIG_PATH}"
-
-# 实例唯一标识：多实例部署时用 UUID 覆盖，否则由面板下发的 token 派生。
-if [ -n "${UUID:-}" ]; then
-  printf '%s' "${UUID}" > "${MACHINE_ID_PATH}"
-elif [ ! -s "${MACHINE_ID_PATH}" ]; then
+if [ -z "$MACHINE_UUID" ]; then
   if [ -r /proc/sys/kernel/random/uuid ]; then
-    cat /proc/sys/kernel/random/uuid > "${MACHINE_ID_PATH}"
+    MACHINE_UUID="$(cat /proc/sys/kernel/random/uuid)"
   else
-    date +%s%N > "${MACHINE_ID_PATH}"
+    MACHINE_UUID="$(date +%s%N)"
   fi
 fi
-MACHINE_UUID="$(cat "${MACHINE_ID_PATH}" 2>/dev/null || echo "")"
-
-cat > "${CONFIG_PATH}" <<YAML
-# OpenRoute 节点客户端配置（由安装脚本生成，可手工修改后重启服务生效）
-# 面板地址（必填）
-base-url: "${PANEL_URL}"
-# 节点密钥（必填）
-token: "${NODE_TOKEN}"
-# 是否为出口节点
-is-outbound: $( [ "${IS_OUTBOUND}" = "1" ] && echo true || echo false )
-# 是否启用 ECH
+single_line "$MACHINE_UUID" || fail "UUID 不能包含换行"
+yaml_quote() {
+  local value="$1"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+cat > "$TMP_CONFIG" <<YAML
+# OpenRoute 节点配置；修改后重启节点服务。
+base-url: $(yaml_quote "$PANEL_URL")
+token: $(yaml_quote "$NODE_TOKEN")
+is-outbound: ${IS_OUTBOUND}
 use-ech: false
 ech-query-name: ""
-
-# 本地监听端口（入口节点使用；0 = 由面板下发时指定）
 direct-port: 0
 ws-port: 0
 tls-port: 0
 udp-port: 0
 rev-port: 0
-
-# 主动连接地址（出口节点使用；留空表示使用面板下发的连接地址）
 connect-host: ""
 connect-direct-port: 0
 connect-ws-port: 0
 connect-tls-port: 0
 connect-udp-port: 0
 connect-rev-port: 0
-
-# 负载均衡权重（仅出口节点，默认 1）
 default-weight: 1
-
-# 实例标识（多实例部署时由 UUID 环境变量指定）
-machine-id: "${MACHINE_UUID}"
+machine-id: $(yaml_quote "$MACHINE_UUID")
 YAML
-chmod 0600 "${CONFIG_PATH}"
+"$TMP_BINARY" -c "$TMP_CONFIG" -check || fail "配置自检失败；旧客户端和配置已保留"
 
-# ── 5. 写入环境变量 env.sh（规格书 5.3）───────────────────────────────
-step "生成环境变量文件 ${ENV_PATH}"
-cat > "${ENV_PATH}" <<SH
-# OpenRoute 节点环境变量（由安装脚本生成）
-# 修改后执行：systemctl restart ${SERVICE_UNIT}
-
-# 禁用 WebSSH 与远程升级（1 = 禁用）
-# DISABLE_EXECUTE=1
-
-# 限定入口监听绑定的网卡/地址，多个用逗号分隔
-$([ -n "${BIND_INBOUND:-}" ] && echo "BIND_INBOUND=${BIND_INBOUND}" || echo "# BIND_INBOUND=0.0.0.0")
-
-# 限制出口出站源地址（不推荐使用）
-# BIND_OUTBOUND_4=
-# BIND_OUTBOUND_6=
-
-# 出站流量打 fwmark，配合策略路由
-# OUTBOUND_FWMARK=
-
-# 探针统计流量的网卡；不设置时使用「智能统计」
-$([ -n "${COUNT_INTERFACE:-}" ] && echo "COUNT_INTERFACE=${COUNT_INTERFACE}" || echo "# COUNT_INTERFACE=eth0")
-
-# 主动健康检查（0 = 禁用，降级为被动判定）
-# HEALTH_CHECK=0
-
-# 多实例部署时的实例唯一值
-$([ -n "${UUID:-}" ] && echo "UUID=${UUID}" || echo "# UUID=")
-
-# 服务名（多实例部署时用于区分 unit）
-# S=${SERVICE_NAME}
-SH
-chmod 0600 "${ENV_PATH}"
-
-# ── 6. 生成卸载脚本 ────────────────────────────────────────────────────
-cat > "${UNINSTALL_PATH}" <<'UNINSTALL_SCRIPT'
-#!/usr/bin/env bash
-#
-# OpenRoute 节点卸载脚本（安装时内嵌生成）
-#
-# 用法：bash /opt/openroute/openroute.uninstall.sh
-#
-set -uo pipefail
-
-if [ "$(id -u)" != "0" ]; then
-  echo "请以 root 身份运行卸载脚本" >&2
-  exit 1
+# 已存在的环境文件保留运维人员的自定义值。
+if [ ! -e "$ENV_PATH" ]; then
+  TMP_ENV="$(mktemp "${INSTALL_DIR}/.env.XXXXXX")"
+  printf '# OpenRoute 节点环境变量；修改后重启 %s\n' "$SERVICE_UNIT" > "$TMP_ENV"
+  for env_name in DISABLE_EXECUTE BIND_INBOUND BIND_OUTBOUND_4 BIND_OUTBOUND_6 OUTBOUND_FWMARK COUNT_INTERFACE HEALTH_CHECK UUID; do
+    env_value="${!env_name-}"
+    if [ -n "$env_value" ]; then
+      single_line "$env_value" || fail "${env_name} 不能包含换行"
+      env_value="${env_value//\\/\\\\}"
+      env_value="${env_value//\"/\\\"}"
+      env_value="${env_value//\$/\\\$}"
+      env_value="${env_value//$'\x60'/\\$'\x60'}"
+      printf '%s="%s"\n' "$env_name" "$env_value" >> "$TMP_ENV"
+    fi
+  done
+  mv -f -- "$TMP_ENV" "$ENV_PATH"
+else
+  info "保留已有环境变量文件 ${ENV_PATH}"
 fi
 
-SERVICE_UNIT="${SERVICE_UNIT:-{{.ServiceUnit}}}"
-INSTALL_DIR="{{.InstallDir}}"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_UNIT}.service"
+mv -f -- "$TMP_BINARY" "$BINARY_PATH"
+mv -f -- "$TMP_CONFIG" "$CONFIG_PATH"
+printf '%s\n' "$MACHINE_UUID" > "$MACHINE_ID_PATH"
+chmod 0600 "$CONFIG_PATH" "$ENV_PATH" "$MACHINE_ID_PATH"
 
-echo "[OpenRoute] 停止并禁用服务 ${SERVICE_UNIT} ..."
-systemctl stop    "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-systemctl disable "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-
-if [ -f "${SERVICE_FILE}" ]; then
-  rm -f "${SERVICE_FILE}"
-  systemctl daemon-reload
-  systemctl reset-failed "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-fi
-
-read -r -p "是否删除安装目录 ${INSTALL_DIR}（含配置与日志）？[y/N] " answer
-case "${answer}" in
-  y|Y|yes|YES)
-    echo "[OpenRoute] 删除 ${INSTALL_DIR} ..."
-    rm -rf "${INSTALL_DIR}"
-    ;;
-  *)
-    echo "[OpenRoute] 已保留 ${INSTALL_DIR}，可手动删除。"
-    ;;
-esac
-
-echo "[OpenRoute] 卸载完成。"
-exit 0
+# 本地卸载脚本绑定命令行解析后的服务实例。
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nSERVICE_NAME=%q\n' "$SERVICE_NAME"
+  cat <<'UNINSTALL_SCRIPT'
+` + uninstallBody + `
 UNINSTALL_SCRIPT
-chmod 0755 "${UNINSTALL_PATH}"
-info "卸载脚本：bash ${UNINSTALL_PATH}"
+} > "$UNINSTALL_PATH"
+chmod 0755 "$UNINSTALL_PATH"
 
-# ── 7. 注册并启用 systemd 服务 ─────────────────────────────────────────
-step "注册 systemd 服务 ${SERVICE_UNIT}"
-
-NOFILE_LIMIT=1048576
-cat > "${SERVICE_FILE}" <<UNIT
+TMP_SERVICE="$(mktemp /etc/systemd/system/.openroute-node.XXXXXX)"
+cat > "$TMP_SERVICE" <<UNIT
 [Unit]
 Description=OpenRoute Node Client (${SERVICE_NAME})
-Documentation=${PANEL_URL}
 After=network-online.target
 Wants=network-online.target
 
@@ -683,40 +599,28 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-${ENV_PATH}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BINARY_PATH} -u ${PANEL_URL} -t ${NODE_TOKEN}
+ExecStart=${BINARY_PATH} -c ${CONFIG_PATH}
 Restart=always
 RestartSec=3
-LimitNOFILE=${NOFILE_LIMIT}
-# 网络转发所需的能力；不使用完整 root 之外的特权
+LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-# 转发场景需要放开内核网络参数
 ProtectSystem=false
 PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-
-# 启动前做一次配置语法自检，避免服务反复重启。
-"${BINARY_PATH}" -c "${CONFIG_PATH}" -check >/dev/null 2>&1 || warn "配置文件自检未通过，请检查 ${CONFIG_PATH}"
-
-systemctl daemon-reload
-systemctl enable "${SERVICE_UNIT}" >/dev/null 2>&1 || warn "enable 失败，请检查 systemd"
-systemctl restart "${SERVICE_UNIT}"
-
+chmod 0644 "$TMP_SERVICE"
+mv -f -- "$TMP_SERVICE" "$SERVICE_FILE"
+systemctl daemon-reload || fail "systemd daemon-reload 失败"
+systemctl enable "$SERVICE_UNIT" >/dev/null 2>&1 || fail "无法启用服务 ${SERVICE_UNIT}"
+systemctl restart "$SERVICE_UNIT" || fail "无法启动服务 ${SERVICE_UNIT}"
 sleep 2
-if systemctl is-active --quiet "${SERVICE_UNIT}"; then
-  info "服务已启动：${SERVICE_UNIT}"
-else
-  warn "服务未能正常启动，请执行：journalctl -fu ${SERVICE_UNIT}"
-fi
+systemctl is-active --quiet "$SERVICE_UNIT" || fail "服务未能正常运行，请执行：journalctl -u ${SERVICE_UNIT} -n 100 --no-pager"
 
-# ── 8. 可选：内核网络参数优化 ──────────────────────────────────────────
-if [ "${OPTIMIZE:-0}" = "1" ]; then
-  step "启用内核网络参数优化 ..."
+if [ "${OPTIMIZE:-0}" = 1 ]; then
   cat > /etc/sysctl.d/99-openroute.conf <<SYSCTL
-# OpenRoute 节点网络优化
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 33554432
@@ -732,79 +636,25 @@ net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
 fs.file-max = 1048576
 SYSCTL
-  if sysctl -p /etc/sysctl.d/99-openroute.conf >/dev/null 2>&1; then
-    info "内核参数已优化（BBR / 缓冲区 / 文件句柄）"
-  else
-    warn "部分内核参数写入失败（内核不支持 BBR 时可忽略）"
-  fi
+  sysctl -p /etc/sysctl.d/99-openroute.conf >/dev/null 2>&1 || warn "部分内核优化参数写入失败"
 fi
 
-# ── 9. 完成 ────────────────────────────────────────────────────────────
 cat <<DONE
 
-============================================================
- OpenRoute 节点安装完成
-------------------------------------------------------------
- 面板地址   : ${PANEL_URL}
- 安装目录   : ${INSTALL_DIR}
- 配置文件   : ${CONFIG_PATH}
- 环境变量   : ${ENV_PATH}
- 服务名     : ${SERVICE_UNIT}
- 实例标识   : ${MACHINE_UUID}
-
- 常用命令：
-   查看状态   systemctl status ${SERVICE_UNIT}
-   重启服务   systemctl restart ${SERVICE_UNIT}
-   实时日志   journalctl -fu ${SERVICE_UNIT}
-   查看版本   ${BINARY_PATH} -h
-   卸载       bash ${UNINSTALL_PATH}
-
- 提示：面板「节点管理」页面刷新后，本机应显示为「在线」。
-============================================================
+[OpenRoute] 节点安装完成，服务已启动：${SERVICE_UNIT}
+面板地址：${PANEL_URL}
+安装目录：${INSTALL_DIR}
+配置文件：${CONFIG_PATH}
+环境变量：${ENV_PATH}
+实例标识：${MACHINE_UUID}
+查看状态：systemctl status ${SERVICE_UNIT}
+查看日志：journalctl -fu ${SERVICE_UNIT}
+查看版本：${BINARY_PATH} -version
+卸载节点：bash ${UNINSTALL_PATH}
+请在面板确认节点注册与心跳状态。
 DONE
-
-exit 0
 `))
 
-// uninstallTemplate 是独立下发的卸载脚本模板（规格书 5.5）。
-var uninstallTemplate = template.Must(template.New("uninstall").Parse(`#!/usr/bin/env bash
-#
-# OpenRoute 节点卸载脚本
-#
-# 用法：bash /opt/openroute/openroute.uninstall.sh
-#
-set -uo pipefail
-
-SERVICE_UNIT="{{.ServiceUnit}}"
-INSTALL_DIR="{{.InstallDir}}"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_UNIT}.service"
-
-if [ "$(id -u)" != "0" ]; then
-  echo "请以 root 身份运行卸载脚本" >&2
-  exit 1
-fi
-
-echo "[OpenRoute] 停止并禁用服务 ${SERVICE_UNIT} ..."
-systemctl stop    "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-systemctl disable "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-
-if [ -f "${SERVICE_FILE}" ]; then
-  rm -f "${SERVICE_FILE}"
-  systemctl daemon-reload
-  systemctl reset-failed "${SERVICE_UNIT}" >/dev/null 2>&1 || true
-fi
-
-read -r -p "是否删除安装目录 ${INSTALL_DIR}（含配置与日志）？[y/N] " answer
-case "${answer}" in
-  y|Y|yes|YES)
-    echo "[OpenRoute] 删除 ${INSTALL_DIR} ..."
-    rm -rf "${INSTALL_DIR}"
-    ;;
-  *)
-    echo "[OpenRoute] 已保留 ${INSTALL_DIR}，可手动删除。"
-    ;;
-esac
-
-echo "[OpenRoute] 卸载完成。"
-exit 0
-`))
+var uninstallTemplate = template.Must(template.New("uninstall").Funcs(template.FuncMap{
+	"sh": shellQuote,
+}).Parse("#!/usr/bin/env bash\nset -euo pipefail\nSERVICE_NAME={{sh .Service}}\n" + uninstallBody))

@@ -39,13 +39,9 @@ cd sshexec && go build -o sshexec.exe .
 ### 1. 交叉编译并打包
 
 ```powershell
-cd openroute
-$env:CGO_ENABLED="0"; $env:GOOS="linux"; $env:GOARCH="amd64"
-go build -trimpath -ldflags "-s -w -X 'github.com/openroute/openroute/internal/app.BuildStamp=20260921'" -o ..\deploy\openroute .
-Remove-Item Env:GOOS,Env:GOARCH,Env:CGO_ENABLED
-
-cd ..
-tar -czf deploy\openroute-deploy.tar.gz -C deploy openroute install.sh -C openroute public
+# 在仓库根目录执行，同时构建面板与三种 Linux 节点客户端
+./deploy/build.ps1
+tar -czf deploy\openroute-deploy.tar.gz -C deploy openroute install.sh node-binaries -C ../openroute public
 ```
 
 > 前端要先构建：`cd openroute/frontend && node node_modules/vite/bin/vite.js build`
@@ -65,6 +61,17 @@ $SS = "$PWD\sshexec\sshexec.exe"
 ```powershell
 & $SS exec -host 38.76.177.65 -user root -pass '密码' -script "$PWD\deploy\install.sh"
 ```
+
+已经运行的面板可使用 `update.sh` 更新后端与节点下载文件。它先备份程序、
+配置和 SQLite 数据库，保留配置和前端；健康检查失败会恢复旧程序：
+
+```powershell
+& $SS exec -host 38.76.177.65 -user root -pass '密码' -script "$PWD\deploy\update.sh"
+```
+
+更新脚本默认读取 `/tmp/openroute-deploy/`，也可在服务器上执行
+`bash update.sh /绝对路径/发布目录`。客户端能力与限制见
+[`NODECLIENT.md`](../openroute/docs/NODECLIENT.md)。
 
 ### 4. 验证
 
@@ -125,7 +132,9 @@ cron 每 6 小时检查一次。安装脚本已挂 `--reloadcmd`：续期成功�
 |---|---|
 | `install.sh` | 服务器端安装脚本（上面第 3 步执行的就是它） |
 | `openroute` | 交叉编译出的 Linux/amd64 二进制（构建产物） |
-| `openroute-deploy.tar.gz` | 部署包：二进制 + `install.sh` + 前端产物 |
+| `build.ps1` | 构建面板和 amd64 / amd64v3 / arm64 节点客户端 |
+| `node-binaries/` | 节点客户端下载文件（构建产物，不提交 Git） |
+| `openroute-deploy.tar.gz` | 部署包：面板 + 节点客户端 + `install.sh` + 前端产物 |
 | `../sshexec/` | 自研 SSH 执行/上传工具（见上文「为什么用自研的 sshexec」） |
 | `../scripts/browser/` | 浏览器级回归测试（真实渲染校验） |
 

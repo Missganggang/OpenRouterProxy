@@ -193,12 +193,12 @@ server {
 
 3. 在目标机器上以 **root** 执行该命令。安装脚本会：
    - 探测系统（Debian 11+ / Ubuntu 22.04+）与架构（amd64 / amd64v3 / arm64）
-   - 下载节点客户端到 `/opt/openroute/`
-   - 写入 `/opt/openroute/config.yml`（`base-url`、`token`、`is-outbound` 等）
+   - 下载节点客户端到 `/opt/openroute-node/`
+   - 写入 `/opt/openroute-node/config.yml`（`base-url`、`token`、`is-outbound` 等）
    - 注册并启用 systemd 服务 `openroute-node`，随后启动
 4. 节点启动后会立即注册并上报系统信息，面板页面刷新后显示「在线」。
 
-**全过程通常在 1 分钟内完成**（含复制粘贴命令）。
+**客户端需随面板一起构建部署。** 构建方式与当前功能范围见 [NODECLIENT.md](NODECLIENT.md)。
 
 ### 6.1 安装脚本环境变量
 
@@ -223,7 +223,7 @@ OPTIMIZE=1 COUNT_INTERFACE=eth0 \
 
 ```bash
 # 卸载
-bash /opt/openroute/openroute.uninstall.sh
+bash /opt/openroute-node/openroute.uninstall.sh
 
 # 服务控制
 systemctl status  openroute-node
@@ -237,10 +237,10 @@ systemctl disable openroute-node
 journalctl -fu openroute-node
 
 # 查看版本
-/opt/openroute/rel_nodeclient -h
+/opt/openroute-node/rel_nodeclient -h
 
-# 手动指定连接地址与端口（调试用）
-/opt/openroute/rel_nodeclient --connect-host 1.2.3.4 --ws-port 2333 --tls-port 2443
+# 检查节点本地配置
+/opt/openroute-node/rel_nodeclient -c /opt/openroute-node/config.yml -check
 ```
 
 ---
